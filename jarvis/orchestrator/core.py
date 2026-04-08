@@ -109,7 +109,7 @@ class Orchestrator:
 
         # Store incoming message in memory
         mem_id = self.spine.store(
-            content=f"Yusuf ({source}): {message}",
+            content=f"{source}: {message}",
             type="interaction",
             source=source,
             metadata={"priority": priority, "timestamp": timestamp, **(metadata or {})},

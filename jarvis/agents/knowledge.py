@@ -2,7 +2,7 @@
 Knowledge Scraping Agent — Background information gathering.
 
 Sources:
-- Reddit via PRAW: Configured subreddits from yusuf.yaml
+- Reddit via PRAW: Configured subreddits from user.yaml
 - HackerNews via Algolia API: Top stories, full comment trees
 - GitHub trending: Python, TypeScript, Rust, AI-tagged repos
 - RSS: Anthropic blog, arXiv cs.AI/cs.LG, AustLII, RBA
@@ -30,7 +30,7 @@ from jarvis.utils.logger import get_logger
 log = get_logger("agents.knowledge")
 
 KNOWLEDGE_DB_PATH = Path(__file__).parent.parent.parent / "data" / "knowledge.db"
-IDENTITY_PATH = Path(__file__).parent.parent / "identity" / "yusuf.yaml"
+IDENTITY_PATH = Path(__file__).parent.parent / "identity" / "user.yaml"
 
 # HackerNews Algolia API
 HN_API = "https://hn.algolia.com/api/v1"

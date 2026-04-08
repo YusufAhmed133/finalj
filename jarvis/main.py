@@ -120,7 +120,7 @@ class JARVIS:
         while True:
             try:
                 user_input = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: input("\nYusuf> ")
+                    None, lambda: input("\n> ")
                 )
             except (EOFError, KeyboardInterrupt):
                 break

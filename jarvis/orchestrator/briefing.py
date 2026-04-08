@@ -45,7 +45,8 @@ class BriefingGenerator:
         date_str = now.strftime("%d %B %Y")
 
         sections = []
-        sections.append(f"Good morning Yusuf. {day_name}, {date_str}.")
+        from jarvis.identity.loader import get_user_first_name
+        sections.append(f"Good morning {get_user_first_name()}. {day_name}, {date_str}.")
 
         # Schedule section — fetch from recent calendar imports or live
         schedule = self._get_todays_schedule()
@@ -70,7 +71,7 @@ class BriefingGenerator:
         if self.intelligence:
             try:
                 polished = await self.intelligence.think(
-                    message=f"Polish this morning briefing into a concise, direct message for Yusuf. Keep all facts, remove fluff:\n\n{raw_briefing}",
+                    message=f"Polish this morning briefing into a concise, direct message. Keep all facts, remove fluff:\n\n{raw_briefing}",
                     context=f"Time: {now.strftime('%H:%M AEST')} on {date_str}",
                 )
                 return polished

@@ -5,33 +5,13 @@ Switches between Tier 1 (browser) and Tier 2 (API) based on config.
 Provides a single interface for the rest of JARVIS to use.
 """
 import asyncio
-import yaml
-from pathlib import Path
 from typing import Optional
 
+from jarvis.identity.loader import get_user_name, get_user_first_name, get_identity_string, get_identity
 from jarvis.utils.logger import get_logger
 from jarvis.utils.crypto import load_secrets
 
 log = get_logger("brain.intelligence")
-
-CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "agents.yaml"
-IDENTITY_PATH = Path(__file__).parent.parent / "identity" / "yusuf.yaml"
-
-
-def _load_identity() -> str:
-    """Load Yusuf's identity as context string."""
-    if IDENTITY_PATH.exists():
-        data = yaml.safe_load(IDENTITY_PATH.read_text())
-        lines = [
-            f"User: {data.get('name', 'Yusuf Ahmed')}, {data.get('age', 18)} years old",
-            f"Location: {data.get('location', {}).get('city', 'Sydney')}, {data.get('location', {}).get('country', 'Australia')}",
-            f"Timezone: {data.get('location', {}).get('timezone', 'Australia/Sydney')}",
-            f"Education: {data.get('education', {}).get('university', 'UNSW')} — {data.get('education', {}).get('degree', '')}",
-            f"Communication: {data.get('communication_style', {}).get('tone', 'Direct, informal')}",
-            f"Health: Cardiac device implanted — cardiac alerts are ALWAYS priority, NEVER suppressed",
-        ]
-        return "\n".join(lines)
-    return "User: Yusuf Ahmed, Sydney, Australia"
 
 
 class Intelligence:
@@ -41,18 +21,25 @@ class Intelligence:
         self.tier = 1
         self._browser_session = None
         self._api_client = None
-        self._identity = _load_identity()
+        self._identity = get_identity_string()
+        self._user_name = get_user_name()
         self._system_prompt = self._build_system_prompt()
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt sent with every query."""
-        return f"""You are JARVIS, a personal AI assistant for Yusuf Ahmed.
+        user = get_identity()
+        style = user.get("communication_style", {})
+        lang = style.get("language", "English")
+        citations = style.get("citations", "")
+        tone = style.get("tone", "Direct")
+
+        return f"""You are JARVIS, a personal AI assistant for {self._user_name}.
 
 {self._identity}
 
 You respond in a structured format. Every response MUST be valid JSON with these fields:
 {{
-    "reply": "The message to send back to Yusuf via Telegram",
+    "reply": "The message to send back to {get_user_first_name()} via WhatsApp",
     "action": null or {{
         "type": "action_type",
         "details": "what to do"
@@ -62,13 +49,11 @@ You respond in a structured format. Every response MUST be valid JSON with these
 }}
 
 Rules:
-- Be direct, informal, zero fluff — match Yusuf's communication style
-- Australian English (colour, organisation, defence)
-- AUD for money, AEST/AEDT for times
-- AGLC4 for legal citations
+- Be direct, informal, zero fluff — match {get_user_first_name()}'s communication style
+- {lang}
+- If an action is needed on the Mac, specify it clearly in the action field
 - Cardiac health alerts are ALWAYS top priority
-- Never validate uncritically — push back when something is wrong
-- If an action is needed on the Mac, specify it clearly in the action field"""
+- Never validate uncritically — push back when something is wrong"""
 
     async def initialize(self) -> bool:
         """Initialize the appropriate intelligence tier."""
@@ -116,7 +101,7 @@ Rules:
         """Send a message to Claude and get a response.
 
         Args:
-            message: Yusuf's message or the orchestrator's query
+            message: User's message or the orchestrator's query
             context: Current state context (time, mode, etc.)
             memory_context: Relevant memories from the spine
 
@@ -128,7 +113,6 @@ Rules:
         if self.tier == 2 and self._api_client:
             return await self._api_client.send_prompt(full_prompt, system=self._system_prompt)
         elif self.tier == 1 and self._browser_session:
-            # For browser, system prompt is included in the message itself
             browser_prompt = f"{self._system_prompt}\n\n---\n\n{full_prompt}"
             return await self._browser_session.send_prompt(browser_prompt)
         else:
@@ -137,19 +121,14 @@ Rules:
     def _build_full_prompt(self, message: str, context: str, memory_context: str) -> str:
         """Build the full prompt with all context."""
         parts = []
-
         if context:
             parts.append(f"Current state:\n{context}")
-
         if memory_context:
             parts.append(f"Relevant memories:\n{memory_context}")
-
-        parts.append(f"Yusuf's message:\n{message}")
-
+        parts.append(f"{get_user_first_name()}'s message:\n{message}")
         return "\n\n---\n\n".join(parts)
 
     async def health_check(self) -> dict:
-        """Check intelligence layer health."""
         if self.tier == 2 and self._api_client:
             return {"tier": 2, **self._api_client.health_check()}
         elif self.tier == 1 and self._browser_session:
@@ -157,7 +136,6 @@ Rules:
         return {"tier": self.tier, "connected": False, "error": "Not initialized"}
 
     async def shutdown(self):
-        """Clean shutdown."""
         if self._browser_session:
             await self._browser_session.disconnect()
         log.info("Intelligence layer shut down")

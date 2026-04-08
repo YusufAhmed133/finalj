@@ -1,7 +1,7 @@
 """
 Communications Agent — Telegram Bot Interface.
 
-Handles all messaging between Yusuf and JARVIS via Telegram.
+Handles all messaging between the user and JARVIS.
 Supports: text messages, voice notes, inline keyboard approvals,
 slash commands, media (photos, documents).
 
@@ -118,10 +118,10 @@ class TelegramBot:
             return
 
         message = update.message.text
-        log.info(f"Text from Yusuf: {message[:80]}")
+        log.info(f"Text received: {message[:80]}")
 
         # Track context
-        self._add_context("Yusuf", message)
+        self._add_context("user", message)
 
         # Route to orchestrator
         response = await self._message_handler(
@@ -168,7 +168,7 @@ class TelegramBot:
             await update.message.reply_text(f"Heard: {transcript[:200]}")
 
             # Process transcription as text message
-            self._add_context("Yusuf (voice)", transcript)
+            self._add_context("user (voice)", transcript)
             response = await self._message_handler(
                 message=transcript,
                 source="telegram",

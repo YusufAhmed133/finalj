@@ -1,4 +1,5 @@
-# Yusuf's Identity — Always included in every Claude prompt
+# User Identity — Always included in every Claude prompt
+# Edit this file to change who JARVIS serves
 name: Yusuf Ahmed
 age: 18
 location:
