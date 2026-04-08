@@ -42,9 +42,10 @@ class JARVIS:
             message_callback=None,  # Set after telegram init
             approval_callback=None,
         )
-        self._shutdown_event = asyncio.Event()
+        self._shutdown_event = None
 
     async def start(self, cli_mode: bool = False):
+        self._shutdown_event = asyncio.Event()
         """Start JARVIS."""
         log.info("=" * 50)
         log.info("JARVIS v3.0 starting...")
@@ -152,23 +153,18 @@ class JARVIS:
 
 def main():
     cli_mode = "--cli" in sys.argv
-
     jarvis = JARVIS()
 
-    # Handle signals for graceful shutdown
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, jarvis.request_shutdown)
+    async def run():
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, jarvis.request_shutdown)
+        await jarvis.start(cli_mode=cli_mode)
 
     try:
-        loop.run_until_complete(jarvis.start(cli_mode=cli_mode))
+        asyncio.run(run())
     except KeyboardInterrupt:
-        log.info("Keyboard interrupt received")
-        loop.run_until_complete(jarvis.shutdown())
-    finally:
-        loop.close()
+        log.info("Keyboard interrupt")
 
 
 if __name__ == "__main__":

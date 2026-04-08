@@ -1,27 +1,27 @@
 """
-Claude.ai Browser Session Manager — Tier 1 Intelligence Layer.
+Claude.ai Browser Session — Tier 1 Intelligence.
 
-Controls Chrome via Playwright CDP to interact with claude.ai.
-User must be logged in with Claude Max subscription.
+Opens claude.ai in a persistent Playwright browser session via Chrome CDP.
+User must be logged in with Claude Max. Session cookies persist in Chrome's profile.
+
+Usage:
+    brain = ClaudeBrowser()
+    await brain.start()
+    response = await brain.think("What is 2+2?")
+    print(response)
 
 Architecture:
-- Chrome launched with --remote-debugging-port=9222
-- Playwright connects via connect_over_cdp()
-- Uses the user's actual Chrome profile (session persists)
-- Types prompts via keyboard events (contenteditable ProseMirror div)
-- Reads streaming responses via DOM polling
-- Parses structured output from Claude
-
-DOM Notes (from research):
-- Input: contenteditable div, NOT textarea
-- Selectors: Use [contenteditable="true"], [role="textbox"], data-* attributes
-- CSS classes are hashed and change across deployments — never rely on them
-- Send: Enter key (not a button click, though button exists)
-- Response: streams into a div; watch for completion signal
+    1. Launch Chrome with --remote-debugging-port=9222 (or connect to existing)
+    2. Connect Playwright via connect_over_cdp()
+    3. Navigate to claude.ai/new
+    4. Type prompt via keyboard (contenteditable ProseMirror div)
+    5. Wait for streaming response to complete
+    6. Read response text, return it
 """
 import asyncio
 import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 
 from jarvis.utils.logger import get_logger
@@ -29,288 +29,235 @@ from jarvis.utils.logger import get_logger
 log = get_logger("brain.claude_browser")
 
 CLAUDE_URL = "https://claude.ai/new"
-CDP_URL = "http://localhost:9222"
+CDP_ENDPOINT = "http://localhost:9222"
 CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME_PROFILE = Path.home() / "Library" / "Application Support" / "Google" / "Chrome-JARVIS"
+
+# Selectors from research (greasyfork userscripts, Agora project)
+INPUT_SELECTORS = [
+    'div.ProseMirror[contenteditable="true"]',          # Primary: ProseMirror editor
+    '[contenteditable="true"][role="textbox"]',          # Fallback
+    'div[contenteditable="true"][translate="no"]',       # Fallback
+    '[contenteditable="true"]',                          # Last resort
+]
+
+RESPONSE_JS = """() => {
+    // Primary: .font-claude-response (stable class for Claude's responses)
+    const msgs = document.querySelectorAll('.font-claude-response');
+    if (msgs.length > 0) return msgs[msgs.length - 1].innerText;
+    // Fallback: data-test-render-count conversation turns
+    const turns = document.querySelectorAll('div[data-test-render-count]');
+    if (turns.length > 0) return turns[turns.length - 1].innerText;
+    // Fallback: any markdown-rendered block
+    const md = document.querySelectorAll('[class*="markdown"]');
+    if (md.length > 0) return md[md.length - 1].innerText;
+    return '';
+}"""
+
+STREAMING_JS = """() => {
+    // Check data-is-streaming attribute
+    if (document.querySelector('[data-is-streaming="true"]')) return true;
+    // Check for visible stop button
+    const btns = document.querySelectorAll('button');
+    for (const btn of btns) {
+        const label = (btn.getAttribute('aria-label') || btn.innerText || '').toLowerCase();
+        if (label.includes('stop') && btn.offsetParent !== null) return true;
+    }
+    return false;
+}"""
 
 
-class ClaudeBrowserSession:
-    """Manages a persistent claude.ai browser session for Tier 1 intelligence."""
+class ClaudeBrowser:
+    """Persistent claude.ai browser session for Tier 1 intelligence."""
 
-    def __init__(self, cdp_url: str = CDP_URL, headless: bool = False):
-        self.cdp_url = cdp_url
-        self.headless = headless
-        self.browser = None
-        self.context = None
-        self.page = None
+    def __init__(self):
         self._playwright = None
-        self._chrome_process = None
+        self._browser = None
+        self._page = None
+        self._chrome_proc = None
+        self._started = False
 
-    async def ensure_chrome_running(self):
-        """Launch Chrome with debugging port if not already running."""
+    async def start(self) -> bool:
+        """Start Chrome and connect Playwright."""
+        # Ensure Chrome is running with debugging port
+        if not await self._ensure_chrome():
+            return False
+
+        # Connect Playwright
+        try:
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+
+            # Use first existing context (has cookies/session)
+            contexts = self._browser.contexts
+            if contexts:
+                ctx = contexts[0]
+            else:
+                ctx = await self._browser.new_context()
+
+            # Find or create claude.ai tab
+            self._page = None
+            for page in ctx.pages:
+                if "claude.ai" in page.url:
+                    self._page = page
+                    log.info(f"Found existing claude.ai tab: {page.url}")
+                    break
+
+            if not self._page:
+                self._page = await ctx.new_page()
+                await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+                log.info("Opened new claude.ai tab")
+
+            # Check if logged in
+            logged_in = await self._is_logged_in()
+            if not logged_in:
+                log.error("Not logged into claude.ai. Log in manually in Chrome first.")
+                return False
+
+            self._started = True
+            log.info("Claude browser session ready")
+            return True
+
+        except Exception as e:
+            log.error(f"Failed to connect: {e}")
+            return False
+
+    async def _ensure_chrome(self) -> bool:
+        """Make sure Chrome is running with remote debugging port."""
         import httpx
         try:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(f"{self.cdp_url}/json/version", timeout=2.0)
-                if resp.status_code == 200:
-                    log.info("Chrome already running with debugging port")
+                r = await client.get(f"{CDP_ENDPOINT}/json/version", timeout=2)
+                if r.status_code == 200:
+                    log.info("Chrome already running with CDP")
                     return True
         except Exception:
             pass
 
-        log.info("Starting Chrome with remote debugging port...")
-        cmd = [
-            CHROME_PATH,
-            f"--remote-debugging-port=9222",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ]
-        self._chrome_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        log.info("Launching Chrome with --remote-debugging-port=9222...")
+        CHROME_PROFILE.mkdir(parents=True, exist_ok=True)
+        self._chrome_proc = subprocess.Popen(
+            [CHROME_PATH, "--remote-debugging-port=9222", "--no-first-run",
+             "--no-default-browser-check", f"--user-data-dir={CHROME_PROFILE}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        # Wait for Chrome to start
-        for _ in range(10):
+
+        for _ in range(15):
             await asyncio.sleep(1)
             try:
                 async with httpx.AsyncClient() as client:
-                    resp = await client.get(f"{self.cdp_url}/json/version", timeout=2.0)
-                    if resp.status_code == 200:
-                        log.info("Chrome started successfully")
+                    r = await client.get(f"{CDP_ENDPOINT}/json/version", timeout=2)
+                    if r.status_code == 200:
+                        log.info("Chrome launched")
                         return True
             except Exception:
                 continue
 
-        log.error("Failed to start Chrome with debugging port")
+        log.error("Chrome failed to start")
         return False
 
-    async def connect(self) -> bool:
-        """Connect Playwright to Chrome via CDP."""
+    async def _is_logged_in(self) -> bool:
+        """Check if user is logged into claude.ai."""
         try:
-            from playwright.async_api import async_playwright
-
-            self._playwright = await async_playwright().start()
-            self.browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
-            contexts = self.browser.contexts
-            if contexts:
-                self.context = contexts[0]
-            else:
-                self.context = await self.browser.new_context()
-
-            # Find or create claude.ai tab
-            self.page = await self._find_or_create_claude_tab()
-            log.info("Connected to Chrome, claude.ai tab ready")
-            return True
-
-        except Exception as e:
-            log.error(f"Failed to connect to Chrome: {e}")
+            for sel in INPUT_SELECTORS:
+                el = await self._page.query_selector(sel)
+                if el:
+                    return True
             return False
-
-    async def _find_or_create_claude_tab(self):
-        """Find an existing claude.ai tab or create a new one."""
-        for page in self.context.pages:
-            if "claude.ai" in page.url:
-                log.info(f"Found existing claude.ai tab: {page.url}")
-                return page
-
-        # No existing tab — create one
-        page = await self.context.new_page()
-        await page.goto(CLAUDE_URL, wait_until="networkidle", timeout=30000)
-        log.info(f"Created new claude.ai tab: {page.url}")
-        return page
-
-    async def is_logged_in(self) -> bool:
-        """Check if user is logged into Claude."""
-        try:
-            # Look for the chat input — if present, user is logged in
-            input_el = await self.page.query_selector(
-                '[contenteditable="true"], [role="textbox"], textarea[placeholder]'
-            )
-            return input_el is not None
         except Exception:
             return False
 
-    async def send_prompt(self, prompt: str, timeout: int = 120) -> str:
-        """Send a prompt to Claude and wait for the complete response.
+    async def think(self, prompt: str, timeout: int = 120) -> str:
+        """Send a prompt to Claude and return the response.
 
-        Args:
-            prompt: The text to send to Claude
-            timeout: Maximum seconds to wait for response
-
-        Returns:
-            Claude's response text
+        Opens a new conversation each time for clean context.
         """
-        if not self.page:
-            raise RuntimeError("Not connected to claude.ai")
+        if not self._started:
+            raise RuntimeError("Browser not started. Call start() first.")
 
-        # Navigate to new conversation if needed
-        if "/new" not in self.page.url and "/chat/" not in self.page.url:
-            await self.page.goto(CLAUDE_URL, wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(2)
+        # Navigate to new conversation
+        await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(2)
 
-        # Find the input element
-        input_selector = '[contenteditable="true"][role="textbox"], [contenteditable="true"][data-placeholder], div.ProseMirror[contenteditable="true"]'
-        try:
-            await self.page.wait_for_selector(input_selector, timeout=10000)
-        except Exception:
-            # Fallback: try any contenteditable
-            input_selector = '[contenteditable="true"]'
-            await self.page.wait_for_selector(input_selector, timeout=10000)
+        # Find input
+        input_el = None
+        for sel in INPUT_SELECTORS:
+            try:
+                await self._page.wait_for_selector(sel, timeout=5000)
+                input_el = await self._page.query_selector(sel)
+                if input_el:
+                    break
+            except Exception:
+                continue
 
-        input_el = await self.page.query_selector(input_selector)
         if not input_el:
             raise RuntimeError("Could not find chat input on claude.ai")
 
-        # Click to focus
+        # Focus and type
         await input_el.click()
         await asyncio.sleep(0.3)
 
-        # Type the prompt using keyboard (necessary for ProseMirror/contenteditable)
-        # Clear any existing text first
-        await self.page.keyboard.press("Meta+a")
-        await asyncio.sleep(0.1)
-
-        # Type in chunks to avoid issues with very long prompts
-        chunk_size = 500
-        for i in range(0, len(prompt), chunk_size):
-            chunk = prompt[i:i + chunk_size]
-            await self.page.keyboard.type(chunk, delay=5)
-            await asyncio.sleep(0.1)
+        # Type prompt in chunks (ProseMirror needs keyboard events)
+        for i in range(0, len(prompt), 200):
+            chunk = prompt[i:i+200]
+            await self._page.keyboard.type(chunk, delay=2)
+            await asyncio.sleep(0.05)
 
         await asyncio.sleep(0.5)
 
-        # Count existing response elements before sending
-        response_count_before = await self._count_responses()
-
         # Send with Enter
-        await self.page.keyboard.press("Enter")
+        await self._page.keyboard.press("Enter")
+
         log.info("Prompt sent, waiting for response...")
 
-        # Wait for response to start streaming
-        response = await self._wait_for_response(response_count_before, timeout)
+        # Wait for response to complete
+        response = await self._wait_for_response(timeout)
+        log.info(f"Response received ({len(response)} chars)")
         return response
 
-    async def _count_responses(self) -> int:
-        """Count current response message elements."""
-        # Claude's responses are in elements with specific data attributes
-        # Try multiple selectors since DOM changes
-        selectors = [
-            '[data-is-streaming]',
-            '[class*="response"]',
-            '[class*="message"][class*="assistant"]',
-            'div[data-testid*="message"]',
-        ]
-        for selector in selectors:
-            elements = await self.page.query_selector_all(selector)
-            if elements:
-                return len(elements)
-        # Fallback: count by role
-        elements = await self.page.query_selector_all('[data-message-author-role="assistant"]')
-        return len(elements)
-
-    async def _wait_for_response(self, count_before: int, timeout: int) -> str:
-        """Wait for Claude's response to complete streaming.
-
-        Strategy:
-        1. Wait for a new response element to appear
-        2. Poll the response text until it stops changing (streaming complete)
-        3. Return the final text
-        """
+    async def _wait_for_response(self, timeout: int) -> str:
+        """Wait for Claude to finish streaming. Dual-check: text stable + no stop button."""
         start = time.time()
-        response_text = ""
+        last_text = ""
         stable_count = 0
 
+        await asyncio.sleep(3)  # Let streaming begin
+
         while time.time() - start < timeout:
-            await asyncio.sleep(1.0)
+            text = await self._page.evaluate(RESPONSE_JS)
+            text = text.strip() if text else ""
 
-            # Try to get the latest response text
-            current_text = await self._get_latest_response_text()
-
-            if current_text and current_text != response_text:
-                response_text = current_text
+            if text and text != last_text:
+                last_text = text
                 stable_count = 0
-            elif current_text:
+            elif text:
                 stable_count += 1
 
-            # Check if streaming indicator is gone (response complete)
-            is_streaming = await self._is_streaming()
+            is_streaming = await self._page.evaluate(STREAMING_JS)
 
-            if not is_streaming and response_text and stable_count >= 2:
-                log.info(f"Response complete ({len(response_text)} chars)")
-                return response_text
+            # Done: text stable for 2 polls AND not streaming
+            if not is_streaming and last_text and stable_count >= 2:
+                return last_text
 
-            # Also check if stop button is gone as completion signal
-            if response_text and stable_count >= 3:
-                log.info(f"Response stable for 3 polls ({len(response_text)} chars)")
-                return response_text
+            # Fallback: text stable for 4 polls regardless
+            if last_text and stable_count >= 4:
+                return last_text
 
-        if response_text:
-            log.warning(f"Response timeout but got partial text ({len(response_text)} chars)")
-            return response_text
+            await asyncio.sleep(1.5)
 
-        raise TimeoutError(f"No response from claude.ai within {timeout}s")
+        if last_text:
+            log.warning("Timeout but got partial response")
+            return last_text
 
-    async def _get_latest_response_text(self) -> str:
-        """Extract text from the most recent assistant response."""
-        # Try multiple selector strategies
-        text = await self.page.evaluate("""() => {
-            // Strategy 1: Find by data attribute
-            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-            if (msgs.length > 0) {
-                return msgs[msgs.length - 1].innerText;
-            }
-            // Strategy 2: Find by class patterns
-            const responses = document.querySelectorAll('[class*="response"], [class*="assistant"]');
-            if (responses.length > 0) {
-                return responses[responses.length - 1].innerText;
-            }
-            // Strategy 3: Find the last message-like container
-            const containers = document.querySelectorAll('[data-testid*="message"]');
-            if (containers.length > 0) {
-                return containers[containers.length - 1].innerText;
-            }
-            return '';
-        }""")
-        return text.strip() if text else ""
+        raise TimeoutError(f"No response within {timeout}s")
 
-    async def _is_streaming(self) -> bool:
-        """Check if Claude is still generating a response."""
-        return await self.page.evaluate("""() => {
-            // Check for streaming indicator
-            const streaming = document.querySelector('[data-is-streaming="true"]');
-            if (streaming) return true;
-            // Check for stop button (visible during generation)
-            const stopBtn = document.querySelector('button[aria-label="Stop"], button[aria-label="Stop generating"]');
-            if (stopBtn && stopBtn.offsetParent !== null) return true;
-            return false;
-        }""")
-
-    async def new_conversation(self):
-        """Start a new conversation."""
-        await self.page.goto(CLAUDE_URL, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
-        log.info("Started new conversation")
-
-    async def disconnect(self):
-        """Disconnect from Chrome (doesn't close Chrome)."""
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
+    async def stop(self):
+        """Disconnect (doesn't close Chrome)."""
+        if self._browser:
+            await self._browser.close()
         if self._playwright:
             await self._playwright.stop()
-            self._playwright = None
-        log.info("Disconnected from Chrome")
-
-    async def health_check(self) -> dict:
-        """Check session health."""
-        status = {
-            "connected": self.browser is not None,
-            "page_url": self.page.url if self.page else None,
-            "logged_in": False,
-        }
-        if self.page:
-            try:
-                status["logged_in"] = await self.is_logged_in()
-            except Exception:
-                status["logged_in"] = False
-        return status
+        self._started = False
+        log.info("Claude browser disconnected")

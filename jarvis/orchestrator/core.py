@@ -23,7 +23,6 @@ from jarvis.brain.intelligence import Intelligence
 from jarvis.orchestrator.priority import score_priority, is_stop_command, is_cardiac_alert
 from jarvis.orchestrator.briefing import BriefingGenerator
 from jarvis.utils.logger import get_logger
-from jarvis.utils.scheduler import create_scheduler, add_daily_job
 
 log = get_logger("orchestrator.core")
 
@@ -47,30 +46,21 @@ class Orchestrator:
         self.graph = EntityGraph()
         self.intelligence = Intelligence()
         self.briefing = BriefingGenerator(self.spine, self.intelligence)
-        self.scheduler = create_scheduler()
 
         self.mode = Mode.ACTIVE
         self.running = False
         self._action_in_progress = False
         self._stop_event = asyncio.Event()
 
-        # Callbacks for sending messages (set by Telegram handler)
         self.send_message_callback = None
         self.send_approval_callback = None
 
     async def initialize(self) -> bool:
-        """Initialize all subsystems."""
         log.info("Initializing JARVIS orchestrator...")
 
-        # Initialize intelligence
         intel_ok = await self.intelligence.initialize()
         if not intel_ok:
-            log.warning("Intelligence layer not ready. JARVIS will operate in limited mode.")
-
-        # Schedule briefings
-        add_daily_job(self.scheduler, self._morning_briefing_job, hour=7, minute=0, name="morning_briefing")
-        add_daily_job(self.scheduler, self._evening_review_job, hour=21, minute=0, name="evening_review")
-        self.scheduler.start()
+            log.warning("Intelligence layer not ready. Operating in limited mode.")
 
         self.running = True
         log.info(f"JARVIS orchestrator initialized. Mode: {self.mode.value}")
@@ -339,7 +329,6 @@ class Orchestrator:
         """Clean shutdown."""
         log.info("Shutting down orchestrator...")
         self.running = False
-        self.scheduler.shutdown()
         await self.intelligence.shutdown()
         self.spine.close()
         log.info("Orchestrator shut down")
