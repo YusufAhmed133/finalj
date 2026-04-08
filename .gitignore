@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 node_modules/
 .env
+whatsapp-bridge/auth_info/
+whatsapp-bridge/media/
