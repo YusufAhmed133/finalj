@@ -1,10 +1,11 @@
 """
-JARVIS Voice Interface — Iron Man orb UI at localhost:8080.
+JARVIS Voice Interface — Iron Man orb UI at localhost:7777.
 
 Black screen with animated orb. Listens via microphone, transcribes with
 faster-whisper, routes through orchestrator, speaks response via macOS TTS.
 
 WebSocket for real-time audio/status. FastAPI serves the page.
+Admin dashboard at /admin.
 """
 import asyncio
 import json
@@ -359,7 +360,73 @@ async def websocket_endpoint(websocket: WebSocket):
         log.info("Voice client disconnected")
 
 
-def run_voice_server(handler: Callable = None, port: int = 8080):
+# --- Admin dashboard at /admin ---
+_spine_ref = None
+_graph_ref = None
+
+def set_data(spine, graph):
+    global _spine_ref, _graph_ref
+    _spine_ref = spine
+    _graph_ref = graph
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin():
+    """Admin dashboard — memory stats, search, entity graph."""
+    from jarvis.memory.spine import MemorySpine
+    from jarvis.memory.graph import EntityGraph
+    spine = _spine_ref or MemorySpine()
+    graph = _graph_ref or EntityGraph()
+    mem = spine.stats()
+    gs = graph.stats()
+
+    recent = spine.get_recent(hours=24, limit=10)
+    rows = ""
+    for m in recent:
+        c = (m.get("content") or "")[:150].replace("<", "&lt;")
+        rows += f'<tr><td>{m.get("tier","?")}</td><td>{m.get("type","?")}</td><td>{c}</td></tr>'
+
+    return f"""<!DOCTYPE html><html><head><title>JARVIS Admin</title>
+<style>body{{background:#0a0a0a;color:#e0e0e0;font-family:system-ui;padding:20px}}
+h1{{color:#4fc3f7}}h2{{color:#81c784}}table{{width:100%;border-collapse:collapse}}
+th,td{{text-align:left;padding:6px;border-bottom:1px solid #222}}th{{color:#aaa}}
+.stat{{font-size:2em;color:#4fc3f7;font-weight:bold}}
+a{{color:#4fc3f7}}</style></head><body>
+<h1>JARVIS Admin</h1><p><a href="/">← Voice Interface</a></p>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+<div><h2>Memory</h2><div class="stat">{mem['total']}</div>
+<p>Hot: {mem['by_tier'].get('hot',0)} | Warm: {mem['by_tier'].get('warm',0)} | Cold: {mem['by_tier'].get('cold',0)} | Archive: {mem['by_tier'].get('archive',0)}</p></div>
+<div><h2>Entities</h2><div class="stat">{gs['total_entities']}</div>
+<p>{gs['total_relations']} relations</p></div></div>
+<h2>Recent (24h)</h2><table><tr><th>Tier</th><th>Type</th><th>Content</th></tr>{rows}</table>
+<h2>Search</h2><form action="/admin/search"><input name="q" placeholder="Search..." style="padding:8px;width:300px;background:#222;border:1px solid #444;color:#fff;border-radius:4px">
+<button style="padding:8px 16px;background:#4fc3f7;color:#000;border:none;border-radius:4px">Search</button></form>
+</body></html>"""
+
+
+@app.get("/admin/search", response_class=HTMLResponse)
+async def admin_search(q: str = ""):
+    from jarvis.memory.spine import MemorySpine
+    spine = _spine_ref or MemorySpine()
+    results = spine.search_text(q, limit=20) if q else []
+    rows = ""
+    for r in results:
+        c = (r.get("content") or "")[:200].replace("<", "&lt;")
+        rows += f'<tr><td>{r.get("tier","?")}</td><td>{c}</td></tr>'
+    return f"""<!DOCTYPE html><html><head><title>Search: {q}</title>
+<style>body{{background:#0a0a0a;color:#e0e0e0;font-family:system-ui;padding:20px}}
+h1{{color:#4fc3f7}}table{{width:100%;border-collapse:collapse}}
+th,td{{text-align:left;padding:6px;border-bottom:1px solid #222}}a{{color:#4fc3f7}}</style></head><body>
+<h1><a href="/admin">←</a> Search: {q}</h1><p>{len(results)} results</p>
+<table><tr><th>Tier</th><th>Content</th></tr>{rows}</table></body></html>"""
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "3.0"}
+
+
+def run_voice_server(handler: Callable = None, port: int = 7777):
     import uvicorn
     if handler:
         set_handler(handler)

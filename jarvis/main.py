@@ -89,7 +89,7 @@ class JARVIS:
             asyncio.create_task(self._knowledge_loop())
             asyncio.create_task(self._briefing_loop())
 
-            # 6. Start voice interface at localhost:8080
+            # 6. Start voice interface at localhost:7777
             asyncio.create_task(self._start_voice_server())
 
             # 7. Wait for shutdown
@@ -102,11 +102,12 @@ class JARVIS:
         """Start voice interface at localhost:8080."""
         try:
             import uvicorn
-            from jarvis.voice.server import app as voice_app, set_handler
+            from jarvis.voice.server import app as voice_app, set_handler, set_data
             set_handler(self.orchestrator.handle_message)
-            config = uvicorn.Config(voice_app, host="0.0.0.0", port=8080, log_level="warning")
+            set_data(self.orchestrator.spine, self.orchestrator.graph)
+            config = uvicorn.Config(voice_app, host="0.0.0.0", port=7777, log_level="warning")
             server = uvicorn.Server(config)
-            log.info("Voice interface at http://localhost:8080")
+            log.info("Voice interface at http://localhost:7777")
             await server.serve()
         except Exception as e:
             log.error(f"Voice server error: {e}")
