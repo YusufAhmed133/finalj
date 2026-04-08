@@ -1,0 +1,42 @@
+# Resume data for form-filling and applications
+name: Yusuf Ahmed
+email: ""  # Fill in
+phone: ""  # Fill in
+address: "Sydney, NSW, Australia"
+
+education:
+  - institution: UNSW Sydney
+    degree: Bachelor of Laws / Bachelor of Commerce (Finance)
+    start: 2025
+    expected_end: 2030
+    wam: 79
+
+skills:
+  technical:
+    - Python
+    - JavaScript/TypeScript
+    - AI/ML systems
+    - Financial modelling
+    - Data analysis
+  legal:
+    - Legal research (AustLII, Westlaw)
+    - AGLC4 citation
+    - Contract analysis
+  soft:
+    - Leadership
+    - Public speaking
+    - Team coordination
+
+activities:
+  - name: UNSW Mending Broken Hearts
+    role: Member
+    description: Building a Total Artificial Heart prototype
+  - name: Investing
+    description: Active investor, IVV DCA strategy
+
+interests:
+  - Artificial intelligence
+  - Finance and markets
+  - Law and policy
+  - Cardiac health technology
+  - Entrepreneurship

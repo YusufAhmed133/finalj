@@ -1,0 +1,64 @@
+# Yusuf's Identity — Always included in every Claude prompt
+name: Yusuf Ahmed
+age: 18
+location:
+  city: Sydney
+  state: NSW
+  country: Australia
+  timezone: Australia/Sydney  # AEST/AEDT
+
+education:
+  university: UNSW Sydney
+  degree: Double degree — Law (LLB) and Commerce (BCom)
+  major: Finance
+  current_wam: 79
+  target_wam: 85
+
+career:
+  path: BigLaw or IB first → PE/VC by 30 → Own company with legacy impact
+  timeline: Graduate → BigLaw/IB → PE/VC by 30
+
+investing:
+  strategy: Fortnightly DCA into IVV
+  target: AUD $1,000,000 by age 30
+  method: Geometric mean unit-price simulation
+  currency: AUD
+
+health:
+  cardiac_device: true
+  cardiac_alert_priority: 100  # ALWAYS priority, NEVER suppressed, ALWAYS interrupts
+  society: UNSW Mending Broken Hearts (Total Artificial Heart prototype)
+
+communication_style:
+  tone: Direct, informal, zero fluff
+  feedback: Wants blunt honesty, pushes back when wrong
+  dislikes: Being validated uncritically, hedging, excessive caveats
+  language: Australian English
+  citations: AGLC4 (for legal)
+
+domains:
+  - AI and Claude ecosystem
+  - Finance (markets, ETFs, IB, PE, VC)
+  - Australian law and case research
+  - Health and fitness (with cardiac awareness)
+  - Startups and entrepreneurship
+  - UNSW academics and WAM optimisation
+
+subreddits_of_interest:
+  - r/LocalLLaMA
+  - r/MachineLearning
+  - r/ClaudeAI
+  - r/artificial
+  - r/singularity
+  - r/programming
+  - r/investing
+  - r/ETFs
+  - r/ausfinance
+  - r/fiaustralia
+  - r/startups
+  - r/entrepreneur
+  - r/auslaw
+  - r/fitness
+  - r/nutrition
+  - r/selfhosted
+  - r/cardiology

@@ -1,0 +1,45 @@
+# JARVIS v3.0 Dependencies
+
+# Intelligence Layer
+anthropic>=0.91.0
+playwright>=1.58.0
+
+# Messaging
+python-telegram-bot>=22.5
+
+# Memory
+sqlite-vec>=0.1.9
+
+# Voice
+faster-whisper>=1.2.1
+
+# Web Framework
+fastapi>=0.128.0
+uvicorn>=0.39.0
+
+# HTTP
+aiohttp>=3.13.0
+httpx>=0.28.0
+requests>=2.32.0
+
+# Scraping
+praw>=7.8.0
+beautifulsoup4>=4.14.0
+feedparser>=6.0.0
+
+# Data Import
+pdfplumber>=0.11.0
+icalendar>=6.3.0
+
+# Scheduling
+apscheduler>=3.11.0
+
+# Security
+cryptography>=46.0.0
+
+# Config
+pyyaml>=6.0.0
+
+# Utilities
+rich>=14.0.0
+Pillow>=11.0.0

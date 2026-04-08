@@ -1,0 +1,74 @@
+# JARVIS Agent Configuration
+
+intelligence:
+  # Tier 1: Browser-based (free, uses Claude Max subscription)
+  # Tier 2: API-based (paid, faster, more reliable)
+  tier: 1  # Change to 2 for API mode
+
+  tier1:
+    browser: chrome
+    debug_port: 9222
+    claude_url: "https://claude.ai/new"
+    response_timeout: 120  # seconds to wait for Claude response
+    session_check_interval: 300  # seconds between session health checks
+
+  tier2:
+    model: "claude-sonnet-4-5-20250514"
+    max_tokens: 8192
+
+computer_use:
+  model: "claude-sonnet-4-5-20250514"
+  screenshot_interval: 1.0  # seconds between screenshots during action
+  max_action_duration: 300  # seconds before force-stopping an action
+
+messaging:
+  platform: telegram
+  polling_mode: true  # true for dev (polling), false for prod (webhook)
+  webhook_url: ""  # Set for production webhook mode
+  context_window: 20  # Number of recent messages to maintain
+
+memory:
+  hot_days: 7
+  warm_days: 30
+  cold_days: 90
+  compaction_hour: 3  # 3am daily
+  embedding_model: "nomic-embed-text"  # Via Ollama
+  embedding_dimensions: 768
+  search_top_k: 10
+
+scraping:
+  interval_minutes: 30
+  max_comments_per_post: 50
+  relevance_threshold: 0.6
+
+briefing:
+  morning_hour: 7  # 7am AEST
+  evening_hour: 21  # 9pm AEST
+
+permissions:
+  # Actions that execute immediately (confirm after)
+  immediate:
+    - open_app
+    - navigate_url
+    - read_screen
+    - search_web
+    - play_music
+    - adjust_volume
+    - take_screenshot
+    - read_file
+
+  # Actions that require approval via Telegram before executing
+  approve_first:
+    - compose_email
+    - fill_form
+    - create_calendar_event
+    - download_file
+    - write_document
+
+  # Actions that require YES + 10-second STOP window
+  critical:
+    - send_email
+    - submit_form
+    - financial_transaction
+    - delete_file
+    - post_publicly
