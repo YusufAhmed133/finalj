@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from jarvis.orchestrator.core import Orchestrator
 from jarvis.agents.comms import TelegramBot
 from jarvis.agents.knowledge import KnowledgeAgent
-from jarvis.agents.computer import ComputerUseAgent
+from jarvis.agents.computer import ComputerAgent
 from jarvis.utils.logger import get_logger
 
 log = get_logger("main")
@@ -37,11 +37,7 @@ class JARVIS:
         self.orchestrator = Orchestrator()
         self.telegram = TelegramBot()
         self.knowledge = KnowledgeAgent(self.orchestrator.spine)
-        self.computer = ComputerUseAgent(
-            spine=self.orchestrator.spine,
-            message_callback=None,  # Set after telegram init
-            approval_callback=None,
-        )
+        self.computer = ComputerAgent(spine=self.orchestrator.spine)
         self._shutdown_event = None
 
     async def start(self, cli_mode: bool = False):
@@ -76,8 +72,8 @@ class JARVIS:
             if telegram_ok:
                 # Wire up callbacks
                 self.orchestrator.send_message_callback = self.telegram.send_message
-                self.computer.message_callback = self.telegram.send_message
-                self.computer.approval_callback = self.telegram.request_approval
+                self.computer.send_message = self.telegram.send_message
+                self.computer.request_approval = self.telegram.request_approval
 
                 # Start Telegram bot
                 await self.telegram.start()
