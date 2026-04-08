@@ -144,6 +144,11 @@ class MemorySpine:
 
     def search_text(self, query: str, limit: int = 10, tier: Optional[str] = None) -> list:
         """Full-text search using FTS5 with BM25 ranking."""
+        import re
+        # Sanitize query for FTS5 — strip special chars that break syntax
+        query = re.sub(r'[^\w\s]', ' ', query).strip()
+        if not query:
+            return []
         if tier:
             rows = self.conn.execute(
                 """SELECT m.*, rank

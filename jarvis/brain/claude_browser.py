@@ -170,13 +170,32 @@ class ClaudeBrowser:
             return False
 
     async def think(self, prompt: str, timeout: int = 120) -> str:
-        """Send a prompt to Claude and return the response."""
+        """Send a prompt in a NEW conversation and return the response."""
         if not self._started:
             raise RuntimeError("Browser not started. Call start() first.")
 
-        # Navigate to new conversation
         await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(1)
+        return await self._send_and_read(prompt, timeout)
+
+    async def think_in_conversation(self, prompt: str, timeout: int = 120) -> str:
+        """Send a prompt in the CURRENT conversation (no navigation)."""
+        if not self._started:
+            raise RuntimeError("Browser not started. Call start() first.")
+        return await self._send_and_read(prompt, timeout)
+
+    async def new_conversation(self):
+        """Navigate to a fresh conversation."""
+        await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(1)
+
+    async def _send_and_read(self, prompt: str, timeout: int) -> str:
+        """Type prompt, send, wait for response."""
+        # Count existing responses before sending
+        pre_count = await self._page.evaluate("""() => {
+            return document.querySelectorAll('.font-claude-response').length
+                || document.querySelectorAll('div[data-test-render-count]').length;
+        }""")
 
         # Find input
         input_el = None
@@ -195,24 +214,18 @@ class ClaudeBrowser:
         await input_el.click()
         await asyncio.sleep(0.2)
 
-        # Paste via clipboard — MUCH faster than typing char by char
-        await self._page.evaluate(
-            "(text) => navigator.clipboard.writeText(text)", prompt
-        )
+        # Paste via clipboard
+        await self._page.evaluate("(text) => navigator.clipboard.writeText(text)", prompt)
         await self._page.keyboard.press("Meta+v")
         await asyncio.sleep(0.3)
-
-        # Send with Enter
         await self._page.keyboard.press("Enter")
 
         log.info("Prompt sent, waiting for response...")
-
-        # Wait for response to complete
-        response = await self._wait_for_response(timeout)
+        response = await self._wait_for_response(timeout, pre_count)
         log.info(f"Response received ({len(response)} chars)")
         return response
 
-    async def _wait_for_response(self, timeout: int) -> str:
+    async def _wait_for_response(self, timeout: int, pre_count: int = 0) -> str:
         """Wait for Claude to finish streaming. Dual-check: text stable + no stop button."""
         start = time.time()
         last_text = ""
@@ -221,6 +234,7 @@ class ClaudeBrowser:
         await asyncio.sleep(2)  # Let streaming begin
 
         while time.time() - start < timeout:
+            # Get the LATEST response (last one on page)
             text = await self._page.evaluate(RESPONSE_JS)
             text = text.strip() if text else ""
 

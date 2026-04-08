@@ -115,42 +115,26 @@ class Orchestrator:
         # Build current state context
         state_context = self._get_state_context()
 
-        # Route to intelligence
+        # Route to intelligence — response comes back as plain text
         try:
-            raw_response = await self.intelligence.think(
+            response = await self.intelligence.think(
                 message=message,
-                context=state_context,
                 memory_context=memory_context,
             )
 
-            # Parse structured response
-            response = self._parse_response(raw_response)
-
             # Store response in memory
             self.spine.store(
-                content=f"JARVIS: {response['reply']}",
+                content=f"JARVIS: {response}",
                 type="interaction",
                 source="jarvis",
                 metadata={"in_reply_to": mem_id},
             )
 
-            # Handle action if specified
-            if response.get("action"):
-                await self._handle_action(response["action"])
-
-            # Store anything Claude says to remember
-            if response.get("remember"):
-                self.spine.store(
-                    content=response["remember"],
-                    type="learned",
-                    source="intelligence",
-                )
-
-            return response["reply"]
+            return response
 
         except Exception as e:
             log.error(f"Intelligence error: {e}")
-            return f"Sorry, I hit an error: {str(e)[:200]}. Try again?"
+            return f"Sorry, hit an error: {str(e)[:200]}"
 
     async def _handle_stop(self) -> str:
         """Handle STOP/KILL command — halt everything immediately."""
