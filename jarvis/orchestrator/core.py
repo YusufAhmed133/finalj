@@ -22,6 +22,7 @@ from jarvis.memory.graph import EntityGraph
 from jarvis.brain.intelligence import Intelligence
 from jarvis.orchestrator.priority import score_priority, is_stop_command, is_cardiac_alert
 from jarvis.orchestrator.briefing import BriefingGenerator
+from jarvis.memory.patterns import PatternLearner
 from jarvis.utils.logger import get_logger
 
 log = get_logger("orchestrator.core")
@@ -46,6 +47,7 @@ class Orchestrator:
         self.graph = EntityGraph()
         self.intelligence = Intelligence()
         self.briefing = BriefingGenerator(self.spine, self.intelligence)
+        self.patterns = PatternLearner(self.spine)
 
         self.mode = Mode.ACTIVE
         self.running = False
@@ -97,6 +99,9 @@ class Orchestrator:
         if is_cardiac_alert(message):
             log.warning(f"CARDIAC ALERT: {message[:100]}")
 
+        # Track patterns
+        self.patterns.record_interaction(message)
+
         # Store incoming message in memory
         mem_id = self.spine.store(
             content=f"{source}: {message}",
@@ -109,11 +114,27 @@ class Orchestrator:
         if message.startswith("/"):
             return await self._handle_command(message)
 
+        # Check if this is a computer task
+        computer_keywords = ["open ", "launch ", "go to ", "navigate to ", "click ",
+                           "close ", "screenshot", "play ", "search for ", "type in ",
+                           "fill ", "send email", "check my calendar"]
+        is_computer_task = any(message.lower().startswith(kw) or message.lower().startswith("jarvis " + kw)
+                              for kw in computer_keywords)
+
+        if is_computer_task and hasattr(self, 'computer') and self.computer:
+            try:
+                # Route to computer agent
+                task_msg = message.lower().replace("jarvis ", "", 1).strip()
+                result = await self.computer.execute(task_msg)
+                self.spine.store(content=f"JARVIS (action): {result}", type="interaction",
+                               source="jarvis", metadata={"in_reply_to": mem_id})
+                return result
+            except Exception as e:
+                log.error(f"Computer use error: {e}")
+                return f"Tried to execute but hit an error: {str(e)[:200]}"
+
         # Search memory for relevant context
         memory_context = self._get_relevant_context(message)
-
-        # Build current state context
-        state_context = self._get_state_context()
 
         # Route to intelligence — response comes back as plain text
         try:
@@ -122,14 +143,8 @@ class Orchestrator:
                 memory_context=memory_context,
             )
 
-            # Store response in memory
-            self.spine.store(
-                content=f"JARVIS: {response}",
-                type="interaction",
-                source="jarvis",
-                metadata={"in_reply_to": mem_id},
-            )
-
+            self.spine.store(content=f"JARVIS: {response}", type="interaction",
+                           source="jarvis", metadata={"in_reply_to": mem_id})
             return response
 
         except Exception as e:

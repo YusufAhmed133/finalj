@@ -50,12 +50,13 @@ class JARVIS:
         # 1. Initialize orchestrator (memory, intelligence, scheduler)
         await self.orchestrator.initialize()
 
-        # 2. Initialize computer use agent
-        computer_ok = await self.computer.initialize()
+        # 2. Initialize computer use agent (uses browser brain, no API key needed)
+        computer_ok = await self.computer.initialize(brain=self.orchestrator.intelligence._browser)
         if computer_ok:
-            log.info("Computer use agent ready")
+            self.orchestrator.computer = self.computer
+            log.info("Computer use agent ready (browser-powered)")
         else:
-            log.warning("Computer use agent unavailable (no API key)")
+            log.warning("Computer use agent unavailable")
 
         # 3. Initialize knowledge agent
         await self.knowledge.initialize()
@@ -88,11 +89,27 @@ class JARVIS:
             asyncio.create_task(self._knowledge_loop())
             asyncio.create_task(self._briefing_loop())
 
-            # 6. Wait for shutdown
+            # 6. Start voice interface at localhost:8080
+            asyncio.create_task(self._start_voice_server())
+
+            # 7. Wait for shutdown
             log.info("JARVIS is online. Waiting for messages...")
             await self._shutdown_event.wait()
 
         await self.shutdown()
+
+    async def _start_voice_server(self):
+        """Start voice interface at localhost:8080."""
+        try:
+            import uvicorn
+            from jarvis.voice.server import app as voice_app, set_handler
+            set_handler(self.orchestrator.handle_message)
+            config = uvicorn.Config(voice_app, host="0.0.0.0", port=8080, log_level="warning")
+            server = uvicorn.Server(config)
+            log.info("Voice interface at http://localhost:8080")
+            await server.serve()
+        except Exception as e:
+            log.error(f"Voice server error: {e}")
 
     async def _knowledge_loop(self):
         """Run knowledge scraping on interval."""

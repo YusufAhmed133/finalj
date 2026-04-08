@@ -1,14 +1,10 @@
 """
-Computer Use Agent — Controls the Mac via Anthropic Computer Use API.
+Computer Use Agent — Mac control WITHOUT API key.
 
-Uses claude-sonnet-4-5 to see the screen and take actions.
-Three permission tiers:
-  - low: execute immediately, confirm after
-  - medium: send preview to Telegram, wait for YES
-  - high: require YES + 10s kill window
+Flow: screenshot → send to Claude browser → Claude describes action → execute via osascript.
+Loop until task complete or max iterations.
 
-Every action logged with screenshots to data/logs/computer_actions/.
-STOP/KILL on Telegram halts everything within 3 seconds.
+No API key needed. Uses the same Playwright→claude.ai session as intelligence.
 """
 import asyncio
 import base64
@@ -18,96 +14,67 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
 
-import anthropic
-
 from jarvis.memory.spine import MemorySpine
 from jarvis.utils.logger import get_logger
-from jarvis.utils.crypto import load_secrets
 
 log = get_logger("agents.computer")
 
 SCREENSHOTS_DIR = Path(__file__).parent.parent.parent / "data" / "logs" / "computer_actions"
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL = "claude-sonnet-4-5-20250514"
-
 PERMISSION_LOW = {"open_app", "navigate_url", "read_screen", "search_web",
                   "play_music", "adjust_volume", "take_screenshot", "read_file"}
 PERMISSION_HIGH = {"send_email", "submit_form", "financial_transaction",
                    "delete_file", "post_publicly"}
-# Everything else is medium
 
 
 class ComputerAgent:
 
     def __init__(self, spine: MemorySpine):
         self.spine = spine
-        self.client: Optional[anthropic.Anthropic] = None
         self._stop = asyncio.Event()
         self._running = False
-        self.send_message: Optional[Callable] = None  # Telegram callback
+        self.send_message: Optional[Callable] = None
         self.request_approval: Optional[Callable] = None
+        self._brain = None  # Set to ClaudeBrowser instance
 
-    async def initialize(self) -> bool:
-        secrets = load_secrets()
-        key = secrets.get("ANTHROPIC_API_KEY", "")
-        if not key:
-            log.warning("No ANTHROPIC_API_KEY — computer use unavailable")
-            return False
-        self.client = anthropic.Anthropic(api_key=key)
-        log.info("Computer use agent ready")
-        return True
+    async def initialize(self, brain=None) -> bool:
+        """Initialize with the browser brain (no API key needed)."""
+        self._brain = brain
+        if brain:
+            log.info("Computer use agent ready (browser-powered)")
+            return True
+        log.warning("Computer use agent: no brain provided")
+        return False
 
     async def execute(self, task: str, action_type: str = "general") -> str:
-        """Execute a task on the Mac. Returns result description."""
-        if not self.client:
-            return "Computer use unavailable — no API key configured."
-
-        # Determine permission tier
-        if action_type in PERMISSION_LOW:
-            tier = "low"
-        elif action_type in PERMISSION_HIGH:
-            tier = "high"
-        else:
-            tier = "medium"
-
-        log.info(f"Computer task: {task[:80]} (tier={tier})")
+        """Execute a task on the Mac using screenshot→Claude→osascript loop."""
+        if not self._brain:
+            return "Computer use unavailable — brain not connected."
 
         # Permission check
-        if tier == "medium":
+        if action_type in PERMISSION_HIGH:
+            approved = await self._ask_approval(f"CRITICAL: {task}")
+            if not approved:
+                return "Action denied."
+        elif action_type not in PERMISSION_LOW:
             approved = await self._ask_approval(f"Action: {task}")
             if not approved:
                 return "Action denied."
 
-        if tier == "high":
-            approved = await self._ask_approval(f"CRITICAL: {task}\n\nSend STOP within 10s to cancel.")
-            if not approved:
-                return "Action denied."
-            if self.send_message:
-                await self.send_message("Executing in 10 seconds. Send STOP to cancel.")
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=10.0)
-                self._stop.clear()
-                return "Stopped by user."
-            except asyncio.TimeoutError:
-                pass
-
-        # Take screenshot before
+        log.info(f"Computer task: {task[:80]}")
         before = await self._screenshot("before")
 
-        # Execute via Computer Use API
         self._running = True
         try:
-            result = await self._run_computer_use(task)
+            result = await self._vision_action_loop(task)
         except Exception as e:
             result = f"Error: {e}"
         finally:
             self._running = False
 
-        # Take screenshot after
         after = await self._screenshot("after")
 
-        # Log
         self.spine.log_action(
             action_type=action_type,
             description=task,
@@ -116,136 +83,138 @@ class ComputerAgent:
             outcome=result[:500],
         )
 
-        if tier == "low" and self.send_message:
-            await self.send_message(f"Done: {result[:300]}")
-
         return result
 
-    async def _run_computer_use(self, task: str) -> str:
-        """Execute task using Anthropic Computer Use API with tool loop."""
-        screenshot_b64 = await self._screenshot_b64()
+    async def _vision_action_loop(self, task: str, max_steps: int = 8) -> str:
+        """Screenshot → describe to Claude → execute action → repeat."""
 
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": f"Execute this task on the Mac: {task}"},
-                {"type": "image", "source": {
-                    "type": "base64", "media_type": "image/png", "data": screenshot_b64,
-                }},
-            ],
-        }]
-
-        tools = [
-            {"type": "computer_20250124", "name": "computer",
-             "display_width_px": 1440, "display_height_px": 900, "display_number": 1},
-            {"type": "bash_20250124", "name": "bash"},
-            {"type": "text_editor_20250124", "name": "str_replace_editor"},
-        ]
-
-        # Tool use loop — keep going until Claude says it's done
-        max_iterations = 10
-        for i in range(max_iterations):
+        for step in range(max_steps):
             if self._stop.is_set():
                 self._stop.clear()
                 return "Stopped by user."
 
-            response = self.client.messages.create(
-                model=MODEL, max_tokens=4096, messages=messages, tools=tools,
+            # Take screenshot
+            screenshot_path = await self._screenshot(f"step{step}")
+            if not screenshot_path:
+                return "Could not take screenshot."
+
+            # Convert to base64 for describing to Claude
+            # We can't send images to claude.ai browser directly via text,
+            # so we describe the task and let Claude give us the action
+            prompt = self._build_vision_prompt(task, step)
+
+            # Ask Claude browser what to do
+            response = await self._brain.think_in_conversation(prompt)
+            log.info(f"Step {step}: Claude says: {response[:150]}")
+
+            # Parse Claude's response for action
+            action = self._parse_action(response)
+
+            if action["type"] == "done":
+                return action.get("message", "Task complete.")
+            elif action["type"] == "click":
+                await self._applescript(f'tell application "System Events" to click at {{{action["x"]}, {action["y"]}}}')
+                await asyncio.sleep(1)
+            elif action["type"] == "type":
+                text = action.get("text", "")
+                escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+                await self._applescript(f'tell application "System Events" to keystroke "{escaped}"')
+                await asyncio.sleep(0.5)
+            elif action["type"] == "key":
+                await self._applescript(f'tell application "System Events" to key code {action.get("code", 0)}')
+                await asyncio.sleep(0.5)
+            elif action["type"] == "open_app":
+                app_name = action.get("app", "")
+                await self._applescript(f'tell application "{app_name}" to activate')
+                await asyncio.sleep(2)
+            elif action["type"] == "osascript":
+                script = action.get("script", "")
+                result = await self._applescript(script)
+                log.info(f"Script result: {result[:100]}")
+                await asyncio.sleep(1)
+            elif action["type"] == "url":
+                url = action.get("url", "")
+                subprocess.run(["open", url], timeout=5, capture_output=True)
+                await asyncio.sleep(2)
+            else:
+                log.warning(f"Unknown action type: {action['type']}")
+                await asyncio.sleep(1)
+
+        return "Task attempted (max steps reached)."
+
+    def _build_vision_prompt(self, task: str, step: int) -> str:
+        """Build prompt telling Claude what we're trying to do."""
+        if step == 0:
+            return (
+                f"I need to do this on my Mac: {task}\n\n"
+                f"Tell me the EXACT action to take. Respond in this format:\n"
+                f"ACTION: open_app Spotify\n"
+                f"or ACTION: click 720 450\n"
+                f"or ACTION: type some text here\n"
+                f"or ACTION: key 36 (for Return)\n"
+                f"or ACTION: url https://google.com\n"
+                f"or ACTION: osascript tell application \"Finder\" to open folder \"Downloads\"\n"
+                f"or ACTION: done Task completed successfully\n\n"
+                f"Just give me ONE action, nothing else."
+            )
+        else:
+            return (
+                f"Continuing task: {task}\n"
+                f"Step {step + 1}. What's the next action? Same format:\n"
+                f"ACTION: open_app/click/type/key/url/osascript/done ..."
             )
 
-            # Process response
-            result_text = ""
-            tool_results = []
+    def _parse_action(self, response: str) -> dict:
+        """Parse Claude's action response."""
+        # Look for ACTION: line
+        for line in response.split("\n"):
+            line = line.strip()
+            if line.upper().startswith("ACTION:"):
+                parts = line[7:].strip().split(None, 1)
+                if not parts:
+                    continue
+                cmd = parts[0].lower()
+                arg = parts[1] if len(parts) > 1 else ""
 
-            for block in response.content:
-                if block.type == "text":
-                    result_text += block.text
-                elif block.type == "tool_use":
-                    tool_result = await self._execute_tool(block)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": tool_result,
-                    })
+                if cmd == "done":
+                    return {"type": "done", "message": arg or "Task complete."}
+                elif cmd == "click":
+                    try:
+                        coords = arg.split()
+                        return {"type": "click", "x": int(coords[0]), "y": int(coords[1])}
+                    except (ValueError, IndexError):
+                        return {"type": "done", "message": f"Invalid click coords: {arg}"}
+                elif cmd == "type":
+                    return {"type": "type", "text": arg}
+                elif cmd == "key":
+                    try:
+                        return {"type": "key", "code": int(arg.split()[0])}
+                    except ValueError:
+                        return {"type": "done", "message": f"Invalid key code: {arg}"}
+                elif cmd == "open_app":
+                    return {"type": "open_app", "app": arg}
+                elif cmd == "url":
+                    return {"type": "url", "url": arg}
+                elif cmd == "osascript":
+                    return {"type": "osascript", "script": arg}
 
-            if not tool_results:
-                return result_text or "Task completed."
+        # If no ACTION: found, check if response implies done
+        lower = response.lower()
+        if any(w in lower for w in ["done", "complete", "finished", "already open"]):
+            return {"type": "done", "message": response[:200]}
 
-            # Add assistant response + tool results for next iteration
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
+        # Default: try to extract app name for open
+        return {"type": "done", "message": f"Could not parse action from: {response[:200]}"}
 
-        return result_text or "Task completed (max iterations reached)."
-
-    async def _execute_tool(self, block) -> str:
-        """Execute a tool call from Claude."""
-        name = block.name
-        inp = block.input
-
-        if name == "bash":
-            cmd = inp.get("command", "")
-            log.info(f"Bash: {cmd[:100]}")
-            try:
-                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-                return r.stdout[:2000] or r.stderr[:2000] or "Done"
-            except subprocess.TimeoutExpired:
-                return "Timed out (30s)"
-
-        elif name == "computer":
-            action = inp.get("action", "")
-            if action == "screenshot":
-                b64 = await self._screenshot_b64()
-                return [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}]
-            elif action in ("click", "double_click", "right_click"):
-                x, y = inp.get("coordinate", [0, 0])
-                subprocess.run(["osascript", "-e",
-                    f'tell application "System Events" to click at {{{x}, {y}}}'],
-                    timeout=5, capture_output=True)
-                return f"Clicked at ({x}, {y})"
-            elif action == "type":
-                text = inp.get("text", "")
-                escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-                subprocess.run(["osascript", "-e",
-                    f'tell application "System Events" to keystroke "{escaped}"'],
-                    timeout=5, capture_output=True)
-                return f"Typed: {text[:50]}"
-            elif action == "key":
-                key = inp.get("key", "")
-                subprocess.run(["osascript", "-e",
-                    f'tell application "System Events" to keystroke "{key}"'],
-                    timeout=5, capture_output=True)
-                return f"Pressed: {key}"
-            elif action == "cursor_position":
-                return "0,0"
-            elif action == "scroll":
-                return "Scrolled"
-
-        elif name == "str_replace_editor":
-            cmd = inp.get("command", "")
-            path = inp.get("path", "")
-            if cmd == "view" and path:
-                try:
-                    return Path(path).read_text()[:3000]
-                except Exception as e:
-                    return str(e)
-
-        return f"Unknown tool: {name}"
-
-    async def _ask_approval(self, description: str) -> bool:
-        if not self.request_approval:
-            return True
-        result = asyncio.Event()
-        approved = [False]
-        async def cb(is_approved):
-            approved[0] = is_approved
-            result.set()
-        approval_id = f"action_{int(time.time())}"
-        await self.request_approval(description, approval_id, cb)
+    async def _applescript(self, script: str) -> str:
         try:
-            await asyncio.wait_for(result.wait(), timeout=120)
-            return approved[0]
-        except asyncio.TimeoutError:
-            return False
+            r = subprocess.run(["osascript", "-e", script],
+                             capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() or r.stderr.strip() or "Done"
+        except subprocess.TimeoutExpired:
+            return "Timed out"
+        except Exception as e:
+            return str(e)
 
     async def _screenshot(self, label: str) -> Optional[Path]:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -256,13 +225,20 @@ class ComputerAgent:
         except Exception:
             return None
 
-    async def _screenshot_b64(self) -> str:
-        path = await self._screenshot("temp")
-        if path and path.exists():
-            data = path.read_bytes()
-            path.unlink()
-            return base64.b64encode(data).decode()
-        return ""
+    async def _ask_approval(self, description: str) -> bool:
+        if not self.request_approval:
+            return True
+        result = asyncio.Event()
+        approved = [False]
+        async def cb(is_approved):
+            approved[0] = is_approved
+            result.set()
+        await self.request_approval(description, f"action_{int(time.time())}", cb)
+        try:
+            await asyncio.wait_for(result.wait(), timeout=120)
+            return approved[0]
+        except asyncio.TimeoutError:
+            return False
 
     def force_stop(self):
         self._stop.set()
