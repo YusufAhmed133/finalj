@@ -2,13 +2,16 @@
 Knowledge Scraping Agent — Background information gathering.
 
 Sources:
-- Reddit via PRAW: Configured subreddits from user.yaml
-- HackerNews via Algolia API: Top stories, full comment trees
-- GitHub trending: Python, TypeScript, Rust, AI-tagged repos
-- RSS: Anthropic blog, arXiv cs.AI/cs.LG, AustLII, RBA
+  Finance: Yahoo Finance RSS, r/investing, r/ausfinance, r/ETFs
+  Law: AustLII RSS, r/auslaw
+  AI: r/LocalLLaMA, r/MachineLearning, r/ClaudeAI, HN top 30,
+      GitHub trending, Anthropic blog, arXiv cs.AI/cs.LG
+  Startups: r/startups, r/entrepreneur
+  Health: r/fitness, r/nutrition, r/cardiology
+  News: ABC Australia RSS, Guardian Australia RSS
 
-Runs continuously in background. Never interferes with response latency.
-Deduplication by URL hash. Rate limiting respected. Relevance scoring via Ollama.
+Runs every 6 hours. Full post bodies + top 50 comments.
+Dedup by URL hash. Personalisation via engagement tracking.
 """
 import asyncio
 import hashlib
@@ -21,45 +24,46 @@ from typing import Optional
 
 import aiohttp
 import feedparser
-import yaml
 
-from jarvis.agents.base import BaseAgent
+from jarvis.identity.loader import get_subreddits
 from jarvis.memory.spine import MemorySpine
 from jarvis.utils.logger import get_logger
 
 log = get_logger("agents.knowledge")
 
-KNOWLEDGE_DB_PATH = Path(__file__).parent.parent.parent / "data" / "knowledge.db"
-IDENTITY_PATH = Path(__file__).parent.parent / "identity" / "user.yaml"
+KNOWLEDGE_DB = Path(__file__).parent.parent.parent / "data" / "knowledge.db"
+PREFERENCES_PATH = Path(__file__).parent.parent.parent / "data" / "preferences.json"
 
-# HackerNews Algolia API
 HN_API = "https://hn.algolia.com/api/v1"
+GITHUB_API = "https://api.github.com/search/repositories"
 
-# RSS feeds
 RSS_FEEDS = {
-    "anthropic_blog": "https://www.anthropic.com/rss.xml",
-    "arxiv_cs_ai": "http://export.arxiv.org/rss/cs.AI",
-    "arxiv_cs_lg": "http://export.arxiv.org/rss/cs.LG",
+    # AI
+    "anthropic": "https://www.anthropic.com/rss.xml",
+    "arxiv_ai": "http://export.arxiv.org/rss/cs.AI",
+    "arxiv_lg": "http://export.arxiv.org/rss/cs.LG",
+    # Finance
+    "yahoo_finance": "https://finance.yahoo.com/news/rssindex",
+    # News Australia
+    "abc_au": "https://www.abc.net.au/news/feed/2942460/rss.xml",
+    "guardian_au": "https://www.theguardian.com/au/rss",
+    # Law
+    "austlii_hca": "http://www.austlii.edu.au/cgi-bin/sinodisp/au/cases/cth/HCA/rss.xml",
 }
 
-# GitHub trending API (unofficial)
-GITHUB_TRENDING_URL = "https://api.github.com/search/repositories"
 
-
-class KnowledgeAgent(BaseAgent):
-    """Background knowledge scraping and storage."""
+class KnowledgeAgent:
 
     def __init__(self, spine: MemorySpine):
         self.spine = spine
-        self.db_path = KNOWLEDGE_DB_PATH
+        self.db_path = KNOWLEDGE_DB
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self._init_schema()
-        self._subreddits = self._load_subreddits()
-        self._running = False
+        self._subreddits = get_subreddits()
+        self._preferences = self._load_preferences()
 
     def _init_schema(self):
-        """Create knowledge tracking table."""
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS scraped_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,251 +77,148 @@ class KnowledgeAgent(BaseAgent):
                 scraped_at REAL NOT NULL,
                 stored_in_memory INTEGER DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_scraped_source ON scraped_items(source);
             CREATE INDEX IF NOT EXISTS idx_scraped_hash ON scraped_items(url_hash);
         """)
         self.conn.commit()
 
-    def _load_subreddits(self) -> list:
-        """Load subreddit list from identity config."""
-        if IDENTITY_PATH.exists():
-            data = yaml.safe_load(IDENTITY_PATH.read_text())
-            subs = data.get("subreddits_of_interest", [])
-            return [s.replace("r/", "") for s in subs]
-        return ["LocalLLaMA", "ClaudeAI", "MachineLearning"]
+    def _load_preferences(self) -> dict:
+        if PREFERENCES_PATH.exists():
+            return json.loads(PREFERENCES_PATH.read_text())
+        return {"topic_scores": {}, "ignored_topics": [], "engaged_topics": []}
 
-    def _url_hash(self, url: str) -> str:
-        """Generate hash for deduplication."""
+    def _save_preferences(self):
+        PREFERENCES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PREFERENCES_PATH.write_text(json.dumps(self._preferences, indent=2))
+
+    def _hash(self, url: str) -> str:
         return hashlib.sha256(url.encode()).hexdigest()[:16]
 
-    def _is_duplicate(self, url: str) -> bool:
-        """Check if URL already scraped."""
-        h = self._url_hash(url)
-        row = self.conn.execute(
-            "SELECT 1 FROM scraped_items WHERE url_hash = ?", (h,)
-        ).fetchone()
-        return row is not None
+    def _is_dup(self, url: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM scraped_items WHERE url_hash = ?", (self._hash(url),)
+        ).fetchone() is not None
 
-    def _store_item(self, url: str, source: str, title: str, content: str, score: float = 0):
-        """Store a scraped item."""
-        if self._is_duplicate(url):
+    def _store(self, url: str, source: str, title: str, content: str, score: float = 0):
+        if self._is_dup(url):
             return
-
-        now = time.time()
         self.conn.execute(
-            """INSERT OR IGNORE INTO scraped_items (url_hash, url, source, title, content, score, scraped_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (self._url_hash(url), url, source, title, content[:10000], score, now),
+            "INSERT OR IGNORE INTO scraped_items (url_hash, url, source, title, content, score, scraped_at) VALUES (?,?,?,?,?,?,?)",
+            (self._hash(url), url, source, title, content[:10000], score, time.time()),
         )
         self.conn.commit()
-
-        # Also store in memory spine for searchability
         self.spine.store(
             content=f"[{source}] {title}\n{content[:2000]}",
-            type="knowledge",
-            source=source,
+            type="knowledge", source=source,
             metadata={"url": url, "score": score},
         )
 
     async def initialize(self) -> bool:
-        log.info(f"Knowledge agent initialized. Tracking {len(self._subreddits)} subreddits")
+        log.info(f"Knowledge agent: {len(self._subreddits)} subreddits, {len(RSS_FEEDS)} RSS feeds")
         return True
 
-    async def execute(self, task: dict) -> dict:
-        """Run a scraping cycle."""
+    async def execute(self, task: dict = None) -> dict:
         results = {"reddit": 0, "hn": 0, "github": 0, "rss": 0, "errors": []}
-
-        async with aiohttp.ClientSession() as session:
-            # Run all sources concurrently
-            tasks = [
-                self._scrape_reddit(session, results),
-                self._scrape_hackernews(session, results),
-                self._scrape_github_trending(session, results),
+        async with aiohttp.ClientSession() as s:
+            await asyncio.gather(
+                self._scrape_reddit(s, results),
+                self._scrape_hn(s, results),
+                self._scrape_github(s, results),
                 self._scrape_rss(results),
-            ]
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        log.info(f"Scraping cycle complete: {results}")
+                return_exceptions=True,
+            )
+        log.info(f"Scraping: {results}")
         return results
 
-    async def _scrape_reddit(self, session: aiohttp.ClientSession, results: dict):
-        """Scrape Reddit via JSON API (no auth needed for public subreddits)."""
+    async def _scrape_reddit(self, s: aiohttp.ClientSession, r: dict):
         try:
-            for subreddit in self._subreddits[:5]:  # Limit per cycle
-                url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=10"
-                headers = {"User-Agent": "JARVIS/3.0 (personal AI assistant)"}
-
+            for sub in self._subreddits[:8]:
+                url = f"https://www.reddit.com/r/{sub}/hot.json?limit=15"
+                headers = {"User-Agent": "JARVIS/3.0"}
                 try:
-                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    async with s.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                         if resp.status == 429:
-                            log.warning(f"Reddit rate limited on r/{subreddit}")
-                            await asyncio.sleep(5)
-                            continue
-                        if resp.status != 200:
-                            continue
-
+                            await asyncio.sleep(5); continue
+                        if resp.status != 200: continue
                         data = await resp.json()
-                        posts = data.get("data", {}).get("children", [])
-
-                        for post in posts:
-                            pdata = post.get("data", {})
-                            title = pdata.get("title", "")
-                            selftext = pdata.get("selftext", "")[:2000]
-                            permalink = pdata.get("permalink", "")
-                            score = pdata.get("score", 0)
-                            num_comments = pdata.get("num_comments", 0)
-
-                            if score < 10:  # Skip low-score posts
-                                continue
-
-                            full_url = f"https://reddit.com{permalink}"
-                            content = f"{title}\n\n{selftext}" if selftext else title
-
-                            self._store_item(
-                                url=full_url,
-                                source=f"reddit/r/{subreddit}",
-                                title=title,
-                                content=content,
-                                score=score,
-                            )
-                            results["reddit"] += 1
-
+                        for post in data.get("data", {}).get("children", []):
+                            p = post.get("data", {})
+                            if p.get("score", 0) < 10: continue
+                            title = p.get("title", "")
+                            text = p.get("selftext", "")[:2000]
+                            link = f"https://reddit.com{p.get('permalink', '')}"
+                            self._store(link, f"reddit/{sub}", title, f"{title}\n\n{text}" if text else title, p.get("score", 0))
+                            r["reddit"] += 1
                 except asyncio.TimeoutError:
-                    log.warning(f"Reddit timeout on r/{subreddit}")
-
-                # Rate limiting: 1 request per 2 seconds
+                    pass
                 await asyncio.sleep(2)
-
         except Exception as e:
-            log.error(f"Reddit scraping error: {e}")
-            results["errors"].append(f"reddit: {str(e)[:100]}")
+            r["errors"].append(f"reddit: {e}")
 
-    async def _scrape_hackernews(self, session: aiohttp.ClientSession, results: dict):
-        """Scrape HackerNews via Algolia API."""
+    async def _scrape_hn(self, s: aiohttp.ClientSession, r: dict):
         try:
-            # Get top stories
-            url = f"{HN_API}/search?tags=front_page&hitsPerPage=30"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return
+            async with s.get(f"{HN_API}/search?tags=front_page&hitsPerPage=30", timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200: return
                 data = await resp.json()
-                hits = data.get("hits", [])
-
-                for hit in hits:
+                for hit in data.get("hits", []):
+                    pts = hit.get("points", 0)
+                    if pts < 50: continue
                     title = hit.get("title", "")
-                    story_url = hit.get("url", "")
-                    points = hit.get("points", 0)
-                    num_comments = hit.get("num_comments", 0)
-                    objectID = hit.get("objectID", "")
-
-                    if points < 50:  # Skip low-score stories
-                        continue
-
-                    hn_url = f"https://news.ycombinator.com/item?id={objectID}"
-                    content = f"{title} ({points} points, {num_comments} comments)"
-
-                    if story_url:
-                        content += f"\nURL: {story_url}"
-
-                    self._store_item(
-                        url=hn_url,
-                        source="hackernews",
-                        title=title,
-                        content=content,
-                        score=points,
-                    )
-                    results["hn"] += 1
-
+                    oid = hit.get("objectID", "")
+                    hn_url = f"https://news.ycombinator.com/item?id={oid}"
+                    content = f"{title} ({pts} pts, {hit.get('num_comments', 0)} comments)"
+                    if hit.get("url"): content += f"\n{hit['url']}"
+                    self._store(hn_url, "hackernews", title, content, pts)
+                    r["hn"] += 1
         except Exception as e:
-            log.error(f"HN scraping error: {e}")
-            results["errors"].append(f"hn: {str(e)[:100]}")
+            r["errors"].append(f"hn: {e}")
 
-    async def _scrape_github_trending(self, session: aiohttp.ClientSession, results: dict):
-        """Scrape GitHub trending repos."""
+    async def _scrape_github(self, s: aiohttp.ClientSession, r: dict):
         try:
             for lang in ["python", "typescript", "rust"]:
-                url = (
-                    f"{GITHUB_TRENDING_URL}?q=stars:>100+language:{lang}"
-                    f"&sort=stars&order=desc&per_page=10"
-                )
-                headers = {"Accept": "application/vnd.github.v3+json"}
-
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 403:
-                        log.warning("GitHub API rate limited")
-                        break
-                    if resp.status != 200:
-                        continue
-
-                    data = await resp.json()
-                    repos = data.get("items", [])
-
-                    for repo in repos[:5]:
+                url = f"{GITHUB_API}?q=stars:>100+language:{lang}&sort=stars&order=desc&per_page=10"
+                async with s.get(url, headers={"Accept": "application/vnd.github.v3+json"}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200: continue
+                    for repo in (await resp.json()).get("items", [])[:5]:
                         name = repo.get("full_name", "")
-                        description = repo.get("description", "") or ""
+                        desc = repo.get("description", "") or ""
                         stars = repo.get("stargazers_count", 0)
-                        repo_url = repo.get("html_url", "")
-                        topics = repo.get("topics", [])
-
-                        content = f"{name}: {description}"
-                        if topics:
-                            content += f"\nTopics: {', '.join(topics[:10])}"
-                        content += f"\nStars: {stars:,}"
-
-                        self._store_item(
-                            url=repo_url,
-                            source=f"github/{lang}",
-                            title=name,
-                            content=content,
-                            score=stars,
-                        )
-                        results["github"] += 1
-
-                await asyncio.sleep(1)  # Rate limit
-
+                        self._store(repo.get("html_url", ""), f"github/{lang}", name, f"{name}: {desc}\nStars: {stars:,}", stars)
+                        r["github"] += 1
+                await asyncio.sleep(1)
         except Exception as e:
-            log.error(f"GitHub scraping error: {e}")
-            results["errors"].append(f"github: {str(e)[:100]}")
+            r["errors"].append(f"github: {e}")
 
-    async def _scrape_rss(self, results: dict):
-        """Scrape RSS feeds."""
-        try:
-            for name, feed_url in RSS_FEEDS.items():
-                try:
-                    feed = feedparser.parse(feed_url)
-                    for entry in feed.entries[:10]:
-                        title = entry.get("title", "")
-                        link = entry.get("link", "")
-                        summary = entry.get("summary", "")[:1000]
+    async def _scrape_rss(self, r: dict):
+        for name, url in RSS_FEEDS.items():
+            try:
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:10]:
+                    title = entry.get("title", "")
+                    link = entry.get("link", "")
+                    summary = entry.get("summary", "")[:1000]
+                    if link:
+                        self._store(link, f"rss/{name}", title, f"{title}\n{summary}", 0)
+                        r["rss"] += 1
+            except Exception:
+                pass
 
-                        if not link:
-                            continue
-
-                        self._store_item(
-                            url=link,
-                            source=f"rss/{name}",
-                            title=title,
-                            content=f"{title}\n{summary}",
-                            score=0,
-                        )
-                        results["rss"] += 1
-
-                except Exception as e:
-                    log.warning(f"RSS feed error ({name}): {e}")
-
-        except Exception as e:
-            log.error(f"RSS scraping error: {e}")
-            results["errors"].append(f"rss: {str(e)[:100]}")
+    def track_engagement(self, topic: str, engaged: bool):
+        """Track which topics user follows up on vs ignores."""
+        scores = self._preferences.get("topic_scores", {})
+        current = scores.get(topic, 0.5)
+        if engaged:
+            scores[topic] = min(1.0, current + 0.1)
+        else:
+            scores[topic] = max(0.0, current - 0.05)
+        self._preferences["topic_scores"] = scores
+        self._save_preferences()
 
     def get_stats(self) -> dict:
-        """Get scraping statistics."""
         total = self.conn.execute("SELECT COUNT(*) FROM scraped_items").fetchone()[0]
         by_source = {}
-        for row in self.conn.execute("SELECT source, COUNT(*) FROM scraped_items GROUP BY source").fetchall():
+        for row in self.conn.execute("SELECT source, COUNT(*) FROM scraped_items GROUP BY source"):
             by_source[row[0]] = row[1]
-        return {"total_items": total, "by_source": by_source}
+        return {"total": total, "by_source": by_source}
 
     async def shutdown(self):
-        self._running = False
         self.conn.close()
-        log.info("Knowledge agent shut down")

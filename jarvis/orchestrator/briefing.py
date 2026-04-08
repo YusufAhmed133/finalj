@@ -1,164 +1,153 @@
 """
-Briefing Generator — Morning and evening briefings.
+Briefing Generator — Morning 7am, Evening 9pm.
 
-Morning (7am AEST):
-- Today's schedule (from Google Calendar)
-- Weather
-- Overnight AI/tech news (from scraped knowledge)
-- Market summary (IVV, key indices)
-- Any pending tasks or reminders
-
-Evening (9pm AEST):
-- What got done today
-- What's pending
-- Tomorrow's schedule preview
+Morning: schedule, weather (Open-Meteo API), overnight AI/market news, pending items.
+Evening: what got done, what's pending, tomorrow preview.
 """
+import asyncio
 from datetime import datetime
 from typing import Optional
 
+import httpx
+
+from jarvis.identity.loader import get_user_first_name, get_identity
 from jarvis.memory.spine import MemorySpine
 from jarvis.utils.logger import get_logger
 
 log = get_logger("orchestrator.briefing")
 
 
+async def _get_weather() -> str:
+    """Get Sydney weather via Open-Meteo (free, no API key)."""
+    try:
+        url = "https://api.open-meteo.com/v1/forecast?latitude=-33.87&longitude=151.21&current=temperature_2m,weathercode&timezone=Australia/Sydney"
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, timeout=10)
+            data = r.json()
+            current = data.get("current", {})
+            temp = current.get("temperature_2m", "?")
+            code = current.get("weathercode", 0)
+            # Simple weather code mapping
+            conditions = {0: "Clear", 1: "Mainly clear", 2: "Partly cloudy",
+                         3: "Overcast", 45: "Foggy", 51: "Light drizzle",
+                         61: "Light rain", 63: "Rain", 65: "Heavy rain",
+                         80: "Showers", 95: "Thunderstorm"}
+            condition = conditions.get(code, f"Code {code}")
+            return f"{temp}°C, {condition}"
+    except Exception as e:
+        log.warning(f"Weather fetch failed: {e}")
+        return "Weather unavailable"
+
+
 class BriefingGenerator:
-    """Generates morning and evening briefings."""
 
     def __init__(self, spine: MemorySpine, intelligence=None):
-        """
-        Args:
-            spine: Memory spine for retrieving context
-            intelligence: Intelligence layer for generating summaries
-        """
         self.spine = spine
         self.intelligence = intelligence
 
     async def morning_briefing(self) -> str:
-        """Generate the morning briefing.
-
-        If intelligence layer is available, uses Claude to synthesize.
-        Otherwise, returns a structured raw briefing.
-        """
+        name = get_user_first_name()
         now = datetime.now()
-        day_name = now.strftime("%A")
-        date_str = now.strftime("%d %B %Y")
+        day = now.strftime("%A")
+        date = now.strftime("%d %B %Y")
 
-        sections = []
-        from jarvis.identity.loader import get_user_first_name
-        sections.append(f"Good morning {get_user_first_name()}. {day_name}, {date_str}.")
+        weather = await _get_weather()
 
-        # Schedule section — fetch from recent calendar imports or live
-        schedule = self._get_todays_schedule()
+        sections = [f"Good morning {name}. {day}, {date}.\nWeather: {weather}"]
+
+        # Schedule from memory
+        schedule = self._get_schedule()
         if schedule:
-            sections.append(f"Schedule:\n{schedule}")
-        else:
-            sections.append("Schedule: Nothing found in memory. Use /calendar to sync.")
+            sections.append(f"Today:\n{schedule}")
 
-        # Overnight knowledge — recent scraped items
-        knowledge = self._get_overnight_knowledge()
+        # Overnight knowledge highlights
+        knowledge = self._get_knowledge_highlights()
         if knowledge:
             sections.append(f"Overnight:\n{knowledge}")
 
-        # Pending items
-        pending = self._get_pending_items()
+        # Pending
+        pending = self._get_pending()
         if pending:
             sections.append(f"Pending:\n{pending}")
 
-        raw_briefing = "\n\n".join(sections)
+        raw = "\n\n".join(sections)
 
-        # If intelligence available, have Claude polish it
+        # Polish with Claude if available
         if self.intelligence:
             try:
                 polished = await self.intelligence.think(
-                    message=f"Polish this morning briefing into a concise, direct message. Keep all facts, remove fluff:\n\n{raw_briefing}",
-                    context=f"Time: {now.strftime('%H:%M AEST')} on {date_str}",
+                    f"Polish this morning briefing. Keep it concise and direct. Don't add fluff:\n\n{raw}"
                 )
                 return polished
             except Exception as e:
-                log.warning(f"Intelligence unavailable for briefing polish: {e}")
+                log.warning(f"Intelligence unavailable for briefing: {e}")
 
-        return raw_briefing
+        return raw
 
     async def evening_review(self) -> str:
-        """Generate the evening review."""
+        name = get_user_first_name()
         now = datetime.now()
-        date_str = now.strftime("%d %B %Y")
+        date = now.strftime("%d %B %Y")
 
-        sections = []
-        sections.append(f"Evening review — {date_str}")
+        sections = [f"Evening review — {date}"]
 
-        # Today's interactions
-        today_memories = self.spine.get_recent(hours=14, type="interaction")
-        if today_memories:
-            topics = set()
-            for mem in today_memories[:10]:
-                content = mem.get("content", "")[:100]
-                topics.add(content.split("\n")[0][:80])
-            sections.append(f"Today's conversations ({len(today_memories)} total):\n" +
-                          "\n".join(f"- {t}" for t in list(topics)[:5]))
+        today = self.spine.get_recent(hours=14, type="interaction")
+        if today:
+            sections.append(f"Conversations: {len(today)} today")
 
-        # Actions taken
         actions = self.spine.get_recent(hours=14, type="action")
         if actions:
-            sections.append(f"Actions taken: {len(actions)}")
+            sections.append(f"Actions: {len(actions)}")
 
-        # Tomorrow preview
-        sections.append("Tomorrow: Check /calendar for schedule.")
+        knowledge = self.spine.get_recent(hours=14, type="knowledge")
+        if knowledge:
+            sections.append(f"Knowledge items scraped: {len(knowledge)}")
 
-        raw_review = "\n\n".join(sections)
+        raw = "\n\n".join(sections)
 
         if self.intelligence:
             try:
-                polished = await self.intelligence.think(
-                    message=f"Polish this evening review into a concise summary:\n\n{raw_review}",
-                    context=f"Time: {now.strftime('%H:%M AEST')} on {date_str}",
+                return await self.intelligence.think(
+                    f"Polish this evening review. Brief and direct:\n\n{raw}"
                 )
-                return polished
-            except Exception as e:
-                log.warning(f"Intelligence unavailable for review polish: {e}")
+            except Exception:
+                pass
 
-        return raw_review
+        return raw
 
-    def _get_todays_schedule(self) -> str:
-        """Get today's calendar events from memory."""
+    def _get_schedule(self) -> str:
         today = datetime.now().strftime("%Y-%m-%d")
-        results = self.spine.search_text(today, limit=10)
-        calendar_results = [r for r in results if r.get("type") in ("import_calendar", "calendar")]
-        if not calendar_results:
-            # Try broader search
-            day_name = datetime.now().strftime("%A")
-            results = self.spine.search_text(day_name, limit=5)
-            calendar_results = [r for r in results if r.get("type") in ("import_calendar", "calendar")]
-
-        if calendar_results:
-            lines = []
-            for r in calendar_results[:5]:
-                content = r.get("content", "")
-                # Extract first line (event name)
-                first_line = content.split("\n")[0]
-                lines.append(f"- {first_line}")
-            return "\n".join(lines)
+        results = self.spine.search_text(today, limit=5)
+        cal = [r for r in results if r.get("type") in ("import_calendar", "calendar")]
+        if cal:
+            return "\n".join(f"- {r['content'].split(chr(10))[0][:100]}" for r in cal[:5])
         return ""
 
-    def _get_overnight_knowledge(self) -> str:
-        """Get scraped knowledge from overnight."""
-        results = self.spine.get_recent(hours=12, type="knowledge")
-        if results:
-            lines = []
-            for r in results[:5]:
-                content = r.get("content", "")[:150]
-                lines.append(f"- {content}")
-            return "\n".join(lines)
-        return ""
+    def _get_knowledge_highlights(self) -> str:
+        items = self.spine.get_recent(hours=12, type="knowledge")
+        if not items:
+            return ""
+        # Top 5 by score (from metadata)
+        scored = []
+        for item in items:
+            try:
+                meta = item.get("metadata")
+                if meta and isinstance(meta, str):
+                    import json
+                    meta = json.loads(meta)
+                score = meta.get("score", 0) if meta else 0
+                scored.append((score, item))
+            except Exception:
+                scored.append((0, item))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        lines = []
+        for _, item in scored[:5]:
+            content = item.get("content", "")[:120]
+            lines.append(f"- {content}")
+        return "\n".join(lines)
 
-    def _get_pending_items(self) -> str:
-        """Get pending reminders or tasks."""
-        results = self.spine.search_text("reminder pending todo", limit=5)
+    def _get_pending(self) -> str:
+        results = self.spine.search_text("reminder pending todo", limit=3)
         if results:
-            lines = []
-            for r in results[:3]:
-                content = r.get("content", "")[:100]
-                lines.append(f"- {content}")
-            return "\n".join(lines)
+            return "\n".join(f"- {r['content'][:100]}" for r in results[:3])
         return ""

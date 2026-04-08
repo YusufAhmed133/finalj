@@ -1,14 +1,14 @@
 """
-Computer Use Agent — Controls the Mac to execute tasks.
+Computer Use Agent — Controls the Mac via Anthropic Computer Use API.
 
-Uses Anthropic Computer Use API with claude-sonnet-4-5.
+Uses claude-sonnet-4-5 to see the screen and take actions.
 Three permission tiers:
-1. Immediate: execute + confirm after (open apps, navigate, read screen)
-2. Approve first: send preview to Telegram, wait for YES
-3. Critical: require YES + 10-second STOP window
+  - low: execute immediately, confirm after
+  - medium: send preview to Telegram, wait for YES
+  - high: require YES + 10s kill window
 
 Every action logged with screenshots to data/logs/computer_actions/.
-STOP command halts everything within 3 seconds.
+STOP/KILL on Telegram halts everything within 3 seconds.
 """
 import asyncio
 import base64
@@ -16,12 +16,10 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Callable, Awaitable
-from enum import Enum
+from typing import Optional, Callable
 
 import anthropic
 
-from jarvis.agents.base import BaseAgent
 from jarvis.memory.spine import MemorySpine
 from jarvis.utils.logger import get_logger
 from jarvis.utils.crypto import load_secrets
@@ -31,366 +29,245 @@ log = get_logger("agents.computer")
 SCREENSHOTS_DIR = Path(__file__).parent.parent.parent / "data" / "logs" / "computer_actions"
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-COMPUTER_USE_MODEL = "claude-sonnet-4-5-20250514"
+MODEL = "claude-sonnet-4-5-20250514"
+
+PERMISSION_LOW = {"open_app", "navigate_url", "read_screen", "search_web",
+                  "play_music", "adjust_volume", "take_screenshot", "read_file"}
+PERMISSION_HIGH = {"send_email", "submit_form", "financial_transaction",
+                   "delete_file", "post_publicly"}
+# Everything else is medium
 
 
-class PermissionTier(Enum):
-    IMMEDIATE = "immediate"       # Execute, confirm after
-    APPROVE_FIRST = "approve"     # Preview → wait for YES → execute
-    CRITICAL = "critical"         # Preview → YES → 10s STOP window → execute
+class ComputerAgent:
 
-
-# Action → permission tier mapping
-ACTION_PERMISSIONS = {
-    # Immediate
-    "open_app": PermissionTier.IMMEDIATE,
-    "navigate_url": PermissionTier.IMMEDIATE,
-    "read_screen": PermissionTier.IMMEDIATE,
-    "search_web": PermissionTier.IMMEDIATE,
-    "play_music": PermissionTier.IMMEDIATE,
-    "adjust_volume": PermissionTier.IMMEDIATE,
-    "take_screenshot": PermissionTier.IMMEDIATE,
-    "read_file": PermissionTier.IMMEDIATE,
-    # Approve first
-    "compose_email": PermissionTier.APPROVE_FIRST,
-    "fill_form": PermissionTier.APPROVE_FIRST,
-    "create_calendar_event": PermissionTier.APPROVE_FIRST,
-    "download_file": PermissionTier.APPROVE_FIRST,
-    "write_document": PermissionTier.APPROVE_FIRST,
-    # Critical
-    "send_email": PermissionTier.CRITICAL,
-    "submit_form": PermissionTier.CRITICAL,
-    "financial_transaction": PermissionTier.CRITICAL,
-    "delete_file": PermissionTier.CRITICAL,
-    "post_publicly": PermissionTier.CRITICAL,
-}
-
-
-class ComputerUseAgent(BaseAgent):
-    """Controls the Mac using Claude's Computer Use API."""
-
-    def __init__(
-        self,
-        spine: MemorySpine,
-        approval_callback: Optional[Callable] = None,
-        message_callback: Optional[Callable] = None,
-    ):
-        """
-        Args:
-            spine: Memory spine for logging actions
-            approval_callback: async fn(description, approval_id) -> bool
-            message_callback: async fn(text) -> None (send to Telegram)
-        """
+    def __init__(self, spine: MemorySpine):
         self.spine = spine
-        self.approval_callback = approval_callback
-        self.message_callback = message_callback
         self.client: Optional[anthropic.Anthropic] = None
-        self._stop_event = asyncio.Event()
+        self._stop = asyncio.Event()
         self._running = False
+        self.send_message: Optional[Callable] = None  # Telegram callback
+        self.request_approval: Optional[Callable] = None
 
     async def initialize(self) -> bool:
-        """Initialize with API key for computer use."""
         secrets = load_secrets()
-        api_key = secrets.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            log.warning("No ANTHROPIC_API_KEY — computer use requires Tier 2 API access")
+        key = secrets.get("ANTHROPIC_API_KEY", "")
+        if not key:
+            log.warning("No ANTHROPIC_API_KEY — computer use unavailable")
             return False
-
-        self.client = anthropic.Anthropic(api_key=api_key)
-        log.info("Computer use agent initialized")
+        self.client = anthropic.Anthropic(api_key=key)
+        log.info("Computer use agent ready")
         return True
 
-    async def execute(self, task: dict) -> dict:
-        """Execute a computer use task.
+    async def execute(self, task: str, action_type: str = "general") -> str:
+        """Execute a task on the Mac. Returns result description."""
+        if not self.client:
+            return "Computer use unavailable — no API key configured."
 
-        Args:
-            task: {"type": "action_type", "details": "what to do", "context": "..."}
+        # Determine permission tier
+        if action_type in PERMISSION_LOW:
+            tier = "low"
+        elif action_type in PERMISSION_HIGH:
+            tier = "high"
+        else:
+            tier = "medium"
 
-        Returns:
-            {"success": bool, "result": str, "screenshots": [paths]}
-        """
-        action_type = task.get("type", "unknown")
-        details = task.get("details", "")
-        permission = ACTION_PERMISSIONS.get(action_type, PermissionTier.APPROVE_FIRST)
-
-        log.info(f"Computer use: {action_type} (permission: {permission.value})")
+        log.info(f"Computer task: {task[:80]} (tier={tier})")
 
         # Permission check
-        if permission == PermissionTier.APPROVE_FIRST:
-            approved = await self._request_approval(
-                f"Action: {action_type}\nDetails: {details}"
-            )
+        if tier == "medium":
+            approved = await self._ask_approval(f"Action: {task}")
             if not approved:
-                return {"success": False, "result": "Denied by user", "screenshots": []}
+                return "Action denied."
 
-        elif permission == PermissionTier.CRITICAL:
-            approved = await self._request_approval(
-                f"CRITICAL ACTION: {action_type}\nDetails: {details}\n\n"
-                f"Send STOP within 10 seconds to cancel."
-            )
+        if tier == "high":
+            approved = await self._ask_approval(f"CRITICAL: {task}\n\nSend STOP within 10s to cancel.")
             if not approved:
-                return {"success": False, "result": "Denied by user", "screenshots": []}
-
-            # 10-second STOP window
-            if self.message_callback:
-                await self.message_callback("Executing in 10 seconds. Send STOP to cancel.")
+                return "Action denied."
+            if self.send_message:
+                await self.send_message("Executing in 10 seconds. Send STOP to cancel.")
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=10.0)
-                # Stop was triggered
-                self._stop_event.clear()
-                return {"success": False, "result": "Stopped by user", "screenshots": []}
+                await asyncio.wait_for(self._stop.wait(), timeout=10.0)
+                self._stop.clear()
+                return "Stopped by user."
             except asyncio.TimeoutError:
-                pass  # No stop — proceed
+                pass
 
         # Take screenshot before
-        screenshot_before = await self._take_screenshot("before")
+        before = await self._screenshot("before")
 
-        # Execute the action
+        # Execute via Computer Use API
         self._running = True
         try:
-            result = await self._execute_with_computer_use(action_type, details)
+            result = await self._run_computer_use(task)
         except Exception as e:
-            result = f"Error: {str(e)}"
+            result = f"Error: {e}"
         finally:
             self._running = False
 
         # Take screenshot after
-        screenshot_after = await self._take_screenshot("after")
+        after = await self._screenshot("after")
 
-        # Log the action
+        # Log
         self.spine.log_action(
             action_type=action_type,
-            description=details,
-            screenshot_before=str(screenshot_before) if screenshot_before else None,
-            screenshot_after=str(screenshot_after) if screenshot_after else None,
-            outcome=result[:500] if isinstance(result, str) else str(result)[:500],
+            description=task,
+            screenshot_before=str(before) if before else None,
+            screenshot_after=str(after) if after else None,
+            outcome=result[:500],
         )
 
-        # Notify result for immediate actions
-        if permission == PermissionTier.IMMEDIATE and self.message_callback:
-            await self.message_callback(f"Done: {action_type} — {result[:200]}")
+        if tier == "low" and self.send_message:
+            await self.send_message(f"Done: {result[:300]}")
 
-        return {
-            "success": "error" not in result.lower() if isinstance(result, str) else True,
-            "result": result,
-            "screenshots": [s for s in [screenshot_before, screenshot_after] if s],
-        }
+        return result
 
-    async def _execute_with_computer_use(self, action_type: str, details: str) -> str:
-        """Execute using Anthropic Computer Use API or AppleScript shortcuts."""
-
-        # Quick actions via AppleScript (faster than full computer use)
-        applescript_actions = {
-            "open_app": lambda d: f'tell application "{d}" to activate',
-            "adjust_volume": lambda d: f'set volume output volume {d}',
-            "play_music": lambda d: 'tell application "Spotify" to play',
-        }
-
-        if action_type in applescript_actions:
-            script = applescript_actions[action_type](details)
-            return await self._run_applescript(script)
-
-        # Full computer use for complex actions
-        if not self.client:
-            return "Computer use unavailable — no API key configured"
-
-        # Take a screenshot to give Claude vision
-        screenshot_b64 = await self._screenshot_base64()
+    async def _run_computer_use(self, task: str) -> str:
+        """Execute task using Anthropic Computer Use API with tool loop."""
+        screenshot_b64 = await self._screenshot_b64()
 
         messages = [{
             "role": "user",
             "content": [
-                {
-                    "type": "text",
-                    "text": f"Execute this action on the Mac: {action_type} — {details}. "
-                            f"Use the computer tools to accomplish this. Be precise and efficient."
-                },
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": screenshot_b64,
-                    },
-                },
+                {"type": "text", "text": f"Execute this task on the Mac: {task}"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": screenshot_b64,
+                }},
             ],
         }]
 
-        try:
+        tools = [
+            {"type": "computer_20250124", "name": "computer",
+             "display_width_px": 1440, "display_height_px": 900, "display_number": 1},
+            {"type": "bash_20250124", "name": "bash"},
+            {"type": "text_editor_20250124", "name": "str_replace_editor"},
+        ]
+
+        # Tool use loop — keep going until Claude says it's done
+        max_iterations = 10
+        for i in range(max_iterations):
+            if self._stop.is_set():
+                self._stop.clear()
+                return "Stopped by user."
+
             response = self.client.messages.create(
-                model=COMPUTER_USE_MODEL,
-                max_tokens=4096,
-                messages=messages,
-                tools=[
-                    {
-                        "type": "computer_20250124",
-                        "name": "computer",
-                        "display_width_px": 1440,
-                        "display_height_px": 900,
-                        "display_number": 1,
-                    },
-                    {
-                        "type": "bash_20250124",
-                        "name": "bash",
-                    },
-                    {
-                        "type": "text_editor_20250124",
-                        "name": "str_replace_editor",
-                    },
-                ],
+                model=MODEL, max_tokens=4096, messages=messages, tools=tools,
             )
 
-            # Process tool calls in the response
-            result_parts = []
+            # Process response
+            result_text = ""
+            tool_results = []
+
             for block in response.content:
                 if block.type == "text":
-                    result_parts.append(block.text)
+                    result_text += block.text
                 elif block.type == "tool_use":
-                    # Execute the tool call
-                    tool_result = await self._execute_tool_call(block)
-                    result_parts.append(f"[{block.name}: {tool_result[:200]}]")
+                    tool_result = await self._execute_tool(block)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": tool_result,
+                    })
 
-            return " ".join(result_parts) or "Action completed"
+            if not tool_results:
+                return result_text or "Task completed."
 
-        except Exception as e:
-            log.error(f"Computer use API error: {e}")
-            return f"Error: {str(e)}"
+            # Add assistant response + tool results for next iteration
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
 
-    async def _execute_tool_call(self, tool_block) -> str:
-        """Execute a tool call from Claude's computer use response."""
-        name = tool_block.name
-        input_data = tool_block.input
+        return result_text or "Task completed (max iterations reached)."
+
+    async def _execute_tool(self, block) -> str:
+        """Execute a tool call from Claude."""
+        name = block.name
+        inp = block.input
 
         if name == "bash":
-            command = input_data.get("command", "")
-            log.info(f"Executing bash: {command[:100]}")
+            cmd = inp.get("command", "")
+            log.info(f"Bash: {cmd[:100]}")
             try:
-                result = subprocess.run(
-                    command, shell=True, capture_output=True, text=True, timeout=30
-                )
-                return result.stdout or result.stderr or "Done"
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                return r.stdout[:2000] or r.stderr[:2000] or "Done"
             except subprocess.TimeoutExpired:
-                return "Command timed out (30s)"
+                return "Timed out (30s)"
 
         elif name == "computer":
-            action = input_data.get("action", "")
-            log.info(f"Computer action: {action}")
-            # Handle mouse/keyboard actions via AppleScript or cliclick
+            action = inp.get("action", "")
             if action == "screenshot":
-                return "Screenshot taken"
+                b64 = await self._screenshot_b64()
+                return [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}]
             elif action in ("click", "double_click", "right_click"):
-                x, y = input_data.get("coordinate", [0, 0])
-                return await self._click(x, y, action)
+                x, y = inp.get("coordinate", [0, 0])
+                subprocess.run(["osascript", "-e",
+                    f'tell application "System Events" to click at {{{x}, {y}}}'],
+                    timeout=5, capture_output=True)
+                return f"Clicked at ({x}, {y})"
             elif action == "type":
-                text = input_data.get("text", "")
-                return await self._type_text(text)
+                text = inp.get("text", "")
+                escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+                subprocess.run(["osascript", "-e",
+                    f'tell application "System Events" to keystroke "{escaped}"'],
+                    timeout=5, capture_output=True)
+                return f"Typed: {text[:50]}"
             elif action == "key":
-                key = input_data.get("key", "")
-                return await self._press_key(key)
+                key = inp.get("key", "")
+                subprocess.run(["osascript", "-e",
+                    f'tell application "System Events" to keystroke "{key}"'],
+                    timeout=5, capture_output=True)
+                return f"Pressed: {key}"
+            elif action == "cursor_position":
+                return "0,0"
+            elif action == "scroll":
+                return "Scrolled"
+
+        elif name == "str_replace_editor":
+            cmd = inp.get("command", "")
+            path = inp.get("path", "")
+            if cmd == "view" and path:
+                try:
+                    return Path(path).read_text()[:3000]
+                except Exception as e:
+                    return str(e)
 
         return f"Unknown tool: {name}"
 
-    async def _click(self, x: int, y: int, click_type: str = "click") -> str:
-        """Click at coordinates using AppleScript."""
-        # Use cliclick if available, otherwise AppleScript
-        script = f"""
-        tell application "System Events"
-            click at {{{x}, {y}}}
-        end tell
-        """
-        # Actually use osascript to move mouse and click
-        cmd = f'osascript -e \'tell application "System Events" to click at {{{x}, {y}}}\''
-        try:
-            subprocess.run(cmd, shell=True, timeout=5, capture_output=True)
-            return f"Clicked at ({x}, {y})"
-        except Exception as e:
-            return f"Click failed: {e}"
-
-    async def _type_text(self, text: str) -> str:
-        """Type text using AppleScript."""
-        # Escape special characters for AppleScript
-        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-        script = f'tell application "System Events" to keystroke "{escaped}"'
-        return await self._run_applescript(script)
-
-    async def _press_key(self, key: str) -> str:
-        """Press a key using AppleScript."""
-        # Map common key names to AppleScript key codes
-        key_map = {
-            "Return": "return", "Enter": "return", "Tab": "tab",
-            "Escape": "escape", "Space": "space",
-        }
-        as_key = key_map.get(key, key.lower())
-        script = f'tell application "System Events" to key code "{as_key}"'
-        return await self._run_applescript(script)
-
-    async def _run_applescript(self, script: str) -> str:
-        """Execute an AppleScript."""
-        try:
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=10,
-            )
-            return result.stdout.strip() or result.stderr.strip() or "Done"
-        except subprocess.TimeoutExpired:
-            return "AppleScript timed out"
-        except Exception as e:
-            return f"AppleScript error: {e}"
-
-    async def _take_screenshot(self, label: str) -> Optional[Path]:
-        """Take a screenshot and save it."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = SCREENSHOTS_DIR / f"{timestamp}_{label}.png"
-        try:
-            subprocess.run(
-                ["screencapture", "-x", str(path)],
-                timeout=5, capture_output=True,
-            )
-            if path.exists():
-                return path
-        except Exception as e:
-            log.error(f"Screenshot failed: {e}")
-        return None
-
-    async def _screenshot_base64(self) -> str:
-        """Take a screenshot and return as base64."""
-        path = await self._take_screenshot("temp")
-        if path and path.exists():
-            data = path.read_bytes()
-            path.unlink()  # Clean up temp screenshot
-            return base64.b64encode(data).decode()
-        return ""
-
-    async def _request_approval(self, description: str) -> bool:
-        """Request approval from the user via Telegram."""
-        if not self.approval_callback:
-            log.warning("No approval callback — auto-approving")
+    async def _ask_approval(self, description: str) -> bool:
+        if not self.request_approval:
             return True
-
-        approval_id = f"action_{int(time.time())}"
         result = asyncio.Event()
         approved = [False]
-
-        async def on_response(is_approved: bool):
+        async def cb(is_approved):
             approved[0] = is_approved
             result.set()
-
-        await self.approval_callback(description, approval_id, on_response)
-
+        approval_id = f"action_{int(time.time())}"
+        await self.request_approval(description, approval_id, cb)
         try:
             await asyncio.wait_for(result.wait(), timeout=120)
             return approved[0]
         except asyncio.TimeoutError:
-            log.warning("Approval timed out (120s)")
             return False
 
+    async def _screenshot(self, label: str) -> Optional[Path]:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = SCREENSHOTS_DIR / f"{ts}_{label}.png"
+        try:
+            subprocess.run(["screencapture", "-x", str(path)], timeout=5, capture_output=True)
+            return path if path.exists() else None
+        except Exception:
+            return None
+
+    async def _screenshot_b64(self) -> str:
+        path = await self._screenshot("temp")
+        if path and path.exists():
+            data = path.read_bytes()
+            path.unlink()
+            return base64.b64encode(data).decode()
+        return ""
+
     def force_stop(self):
-        """Force stop all actions immediately."""
-        self._stop_event.set()
+        self._stop.set()
         self._running = False
-        log.warning("FORCE STOP triggered")
+        log.warning("FORCE STOP")
 
     async def shutdown(self):
-        """Clean shutdown."""
         self.force_stop()
-        log.info("Computer use agent shut down")
