@@ -170,22 +170,19 @@ class ClaudeBrowser:
             return False
 
     async def think(self, prompt: str, timeout: int = 120) -> str:
-        """Send a prompt to Claude and return the response.
-
-        Opens a new conversation each time for clean context.
-        """
+        """Send a prompt to Claude and return the response."""
         if not self._started:
             raise RuntimeError("Browser not started. Call start() first.")
 
         # Navigate to new conversation
         await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
         # Find input
         input_el = None
         for sel in INPUT_SELECTORS:
             try:
-                await self._page.wait_for_selector(sel, timeout=5000)
+                await self._page.wait_for_selector(sel, timeout=3000)
                 input_el = await self._page.query_selector(sel)
                 if input_el:
                     break
@@ -195,17 +192,15 @@ class ClaudeBrowser:
         if not input_el:
             raise RuntimeError("Could not find chat input on claude.ai")
 
-        # Focus and type
         await input_el.click()
+        await asyncio.sleep(0.2)
+
+        # Paste via clipboard — MUCH faster than typing char by char
+        await self._page.evaluate(
+            "(text) => navigator.clipboard.writeText(text)", prompt
+        )
+        await self._page.keyboard.press("Meta+v")
         await asyncio.sleep(0.3)
-
-        # Type prompt in chunks (ProseMirror needs keyboard events)
-        for i in range(0, len(prompt), 200):
-            chunk = prompt[i:i+200]
-            await self._page.keyboard.type(chunk, delay=2)
-            await asyncio.sleep(0.05)
-
-        await asyncio.sleep(0.5)
 
         # Send with Enter
         await self._page.keyboard.press("Enter")
@@ -223,7 +218,7 @@ class ClaudeBrowser:
         last_text = ""
         stable_count = 0
 
-        await asyncio.sleep(3)  # Let streaming begin
+        await asyncio.sleep(2)  # Let streaming begin
 
         while time.time() - start < timeout:
             text = await self._page.evaluate(RESPONSE_JS)
@@ -241,11 +236,11 @@ class ClaudeBrowser:
             if not is_streaming and last_text and stable_count >= 2:
                 return last_text
 
-            # Fallback: text stable for 4 polls regardless
-            if last_text and stable_count >= 4:
+            # Fallback: text stable for 3 polls regardless
+            if last_text and stable_count >= 3:
                 return last_text
 
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
 
         if last_text:
             log.warning("Timeout but got partial response")
