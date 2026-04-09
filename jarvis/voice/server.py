@@ -251,15 +251,37 @@ body {
     text-transform: uppercase; opacity: 0.5;
 }
 #transcript {
-    position: fixed; bottom: 70px; left: 50%; transform: translateX(-50%);
+    position: fixed; bottom: 120px; left: 50%; transform: translateX(-50%);
     max-width: 600px; text-align: center; font-size: 13px;
     color: rgba(0,180,255,0.5); opacity: 0.7;
 }
 #response {
-    position: fixed; bottom: 25px; left: 50%; transform: translateX(-50%);
+    position: fixed; bottom: 65px; left: 50%; transform: translateX(-50%);
     max-width: 700px; text-align: center; font-size: 15px;
     color: #00d4ff; line-height: 1.4;
 }
+/* Controls bar */
+#controls {
+    position: fixed; bottom: 15px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 8px; align-items: center;
+}
+#textInput {
+    width: 350px; padding: 8px 14px;
+    background: rgba(0,180,255,0.08); border: 1px solid rgba(0,180,255,0.25);
+    border-radius: 20px; color: #00d4ff; font-family: 'Courier New', monospace;
+    font-size: 13px; outline: none;
+}
+#textInput::placeholder { color: rgba(0,180,255,0.3); }
+#textInput:focus { border-color: rgba(0,180,255,0.5); background: rgba(0,180,255,0.12); }
+.ctrl-btn {
+    padding: 8px 14px; border: 1px solid rgba(0,180,255,0.25);
+    background: rgba(0,180,255,0.08); color: rgba(0,180,255,0.6);
+    border-radius: 20px; font-family: 'Courier New', monospace;
+    font-size: 11px; letter-spacing: 2px; cursor: pointer;
+    text-transform: uppercase; transition: all 0.2s;
+}
+.ctrl-btn:hover { background: rgba(0,180,255,0.15); color: #00d4ff; border-color: rgba(0,180,255,0.5); }
+.ctrl-btn.active { background: rgba(255,80,80,0.15); border-color: rgba(255,80,80,0.4); color: rgba(255,80,80,0.7); }
 #nav { position: fixed; top: 12px; right: 18px; font-size: 10px; letter-spacing: 3px; }
 #nav a { color: rgba(0,180,255,0.3); text-decoration: none; }
 #nav a:hover { color: #00d4ff; }
@@ -293,6 +315,10 @@ body::after {
 <div id="status">STANDBY</div>
 <div id="transcript"></div>
 <div id="response"></div>
+<div id="controls">
+    <input type="text" id="textInput" placeholder="Type a command..." autocomplete="off">
+    <button class="ctrl-btn" id="muteBtn" onclick="toggleMute()">MIC ON</button>
+</div>
 
 <script>
 const reactor = document.getElementById('reactor');
@@ -380,8 +406,8 @@ function startListening() {
     };
 
     recognition.onend = () => {
-        if (!isProcessing) {
-            recognition.start(); // Auto-restart
+        if (!isProcessing && micEnabled) {
+            recognition.start(); // Auto-restart only if mic enabled
         }
     };
 
@@ -446,11 +472,16 @@ async function processCommand(text) {
     }
 
     await new Promise(r => setTimeout(r, 500));
-    setState('listening');
     isProcessing = false;
     transcriptEl.textContent = '';
     setTimeout(() => { responseEl.textContent = ''; }, 5000);
-    recognition.start();
+    if (micEnabled) {
+        setState('listening');
+        recognition.start();
+    } else {
+        setState('');
+        statusEl.textContent = 'MIC OFF';
+    }
 }
 
 // Init mic for waveform visualization
@@ -468,8 +499,38 @@ async function initMic() {
     }
 }
 
+// Text input handler
+const textInput = document.getElementById('textInput');
+const muteBtn = document.getElementById('muteBtn');
+let micEnabled = true;
+
+textInput.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter' && textInput.value.trim()) {
+        const text = textInput.value.trim();
+        textInput.value = '';
+        transcriptEl.textContent = text;
+        await processCommand(text);
+    }
+});
+
+function toggleMute() {
+    micEnabled = !micEnabled;
+    if (micEnabled) {
+        muteBtn.textContent = 'MIC ON';
+        muteBtn.classList.remove('active');
+        if (recognition) recognition.start();
+        setState('listening');
+    } else {
+        muteBtn.textContent = 'MIC OFF';
+        muteBtn.classList.add('active');
+        if (recognition) recognition.stop();
+        setState('');
+        statusEl.textContent = 'MIC OFF';
+    }
+}
+
 initMic();
-startListening();
+if (micEnabled) startListening();
 </script>
 </body>
 </html>"""
