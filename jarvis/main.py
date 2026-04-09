@@ -82,7 +82,7 @@ class JARVIS:
 
             # 5. Start background tasks
             asyncio.create_task(self._knowledge_loop())
-            asyncio.create_task(self._briefing_loop())
+            asyncio.create_task(self._heartbeat_loop())
 
             # 6. Start voice interface at localhost:7777
             asyncio.create_task(self._start_voice_server())
@@ -123,44 +123,22 @@ class JARVIS:
             except asyncio.TimeoutError:
                 continue
 
-    async def _briefing_loop(self):
-        """Check every minute if it's time for morning or evening briefing."""
-        from jarvis.orchestrator.briefing import BriefingGenerator
-        briefer = BriefingGenerator(self.orchestrator.spine, self.orchestrator.intelligence)
-        sent_today_morning = False
-        sent_today_evening = False
-        last_date = None
+    async def _heartbeat_loop(self):
+        """Proactive agent — checks every minute for things JARVIS should do."""
+        from jarvis.orchestrator.heartbeat import Heartbeat
+
+        heartbeat = Heartbeat(
+            spine=self.orchestrator.spine,
+            patterns=self.orchestrator.patterns,
+            intelligence=self.orchestrator.intelligence,
+            send_callback=self.telegram.send_message if self.telegram else None,
+        )
 
         while not self._shutdown_event.is_set():
             try:
-                from datetime import datetime
-                now = datetime.now()
-                today = now.strftime("%Y-%m-%d")
-
-                # Reset flags on new day
-                if today != last_date:
-                    sent_today_morning = False
-                    sent_today_evening = False
-                    last_date = today
-
-                # Morning briefing at 7am
-                if now.hour == 7 and now.minute < 5 and not sent_today_morning:
-                    log.info("Generating morning briefing...")
-                    text = await briefer.morning_briefing()
-                    if self.telegram and text:
-                        await self.telegram.send_message(text)
-                    sent_today_morning = True
-
-                # Evening review at 9pm
-                if now.hour == 21 and now.minute < 5 and not sent_today_evening:
-                    log.info("Generating evening review...")
-                    text = await briefer.evening_review()
-                    if self.telegram and text:
-                        await self.telegram.send_message(text)
-                    sent_today_evening = True
-
+                await heartbeat.tick()
             except Exception as e:
-                log.error(f"Briefing error: {e}")
+                log.error(f"Heartbeat error: {e}")
 
             try:
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=60)
