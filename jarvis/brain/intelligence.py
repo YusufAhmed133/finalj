@@ -18,15 +18,8 @@ class Intelligence:
         self._ready = False
 
     def _system_context(self):
-        name = get_user_first_name()
-        identity = get_identity_string()
-        return (
-            f"You are JARVIS — modelled after Alfred from Batman. "
-            f"British, dry-witted, concise. 1-3 sentences. "
-            f"Call user 'sir' occasionally.\n"
-            f"User: {identity}\n"
-            f"You have full computer control. Just do what's asked."
-        )
+        from jarvis.identity.system_prompt import build_system_prompt
+        return build_system_prompt()
 
     async def initialize(self) -> bool:
         # Try Cowork bridge first (best — full computer use)
