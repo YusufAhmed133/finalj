@@ -12,6 +12,7 @@ import httpx
 
 from jarvis.identity.loader import get_user_first_name, get_identity
 from jarvis.memory.spine import MemorySpine
+from jarvis.memory.patterns import PatternLearner
 from jarvis.utils.logger import get_logger
 
 log = get_logger("orchestrator.briefing")
@@ -41,9 +42,10 @@ async def _get_weather() -> str:
 
 class BriefingGenerator:
 
-    def __init__(self, spine: MemorySpine, intelligence=None):
+    def __init__(self, spine: MemorySpine, intelligence=None, patterns: PatternLearner = None):
         self.spine = spine
         self.intelligence = intelligence
+        self.patterns = patterns
 
     async def morning_briefing(self) -> str:
         name = get_user_first_name()
@@ -64,6 +66,14 @@ class BriefingGenerator:
         knowledge = self._get_knowledge_highlights()
         if knowledge:
             sections.append(f"Overnight:\n{knowledge}")
+
+        # Auto-briefing topics (from pattern learner)
+        if self.patterns:
+            auto_topics = self.patterns.get_auto_briefing_topics()
+            if auto_topics:
+                topic_updates = self._get_topic_updates(auto_topics)
+                if topic_updates:
+                    sections.append(f"Tracked topics:\n{topic_updates}")
 
         # Pending
         pending = self._get_pending()
@@ -144,6 +154,17 @@ class BriefingGenerator:
         for _, item in scored[:5]:
             content = item.get("content", "")[:120]
             lines.append(f"- {content}")
+        return "\n".join(lines)
+
+    def _get_topic_updates(self, topics: list) -> str:
+        """Search memory for recent activity on auto-briefing topics."""
+        lines = []
+        for topic in topics[:5]:
+            results = self.spine.search_text(topic, limit=2)
+            if results:
+                latest = results[0]
+                content = (latest.get("summary") or latest.get("content", ""))[:120]
+                lines.append(f"- {topic}: {content}")
         return "\n".join(lines)
 
     def _get_pending(self) -> str:

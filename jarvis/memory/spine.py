@@ -143,12 +143,22 @@ class MemorySpine:
         return mem_id
 
     def search_text(self, query: str, limit: int = 10, tier: Optional[str] = None) -> list:
-        """Full-text search using FTS5 with BM25 ranking."""
-        import re
-        # Sanitize query for FTS5 — strip special chars that break syntax
-        query = re.sub(r'[^\w\s]', ' ', query).strip()
-        if not query:
+        """Full-text search using FTS5 with BM25 ranking + recency boost.
+
+        Extracts keywords, uses OR matching (more recall), then re-ranks
+        with a combined score of BM25 relevance + recency.
+        """
+        keywords = self._extract_search_keywords(query)
+        if not keywords:
             return []
+
+        # Use OR for broader recall — AND is too strict for natural language
+        fts_query = " OR ".join(keywords)
+
+        # Fetch more candidates than needed so we can re-rank
+        fetch_limit = limit * 3
+        now = time.time()
+
         if tier:
             rows = self.conn.execute(
                 """SELECT m.*, rank
@@ -157,7 +167,7 @@ class MemorySpine:
                    WHERE memories_fts MATCH ? AND m.tier = ?
                    ORDER BY rank
                    LIMIT ?""",
-                (query, tier, limit),
+                (fts_query, tier, fetch_limit),
             ).fetchall()
         else:
             rows = self.conn.execute(
@@ -167,9 +177,62 @@ class MemorySpine:
                    WHERE memories_fts MATCH ?
                    ORDER BY rank
                    LIMIT ?""",
-                (query, limit),
+                (fts_query, fetch_limit),
             ).fetchall()
-        return [dict(r) for r in rows]
+
+        # Re-rank: combine BM25 (negative, lower=better) with recency boost
+        results = []
+        for r in rows:
+            d = dict(r)
+            age_days = (now - d.get("created_at", now)) / 86400
+            # BM25 rank is negative (closer to 0 = better); normalise to positive relevance
+            bm25_score = -d.get("rank", 0)
+            # Recency: exponential decay, half-life of 7 days
+            recency_boost = 2.0 ** (-age_days / 7.0)
+            d["_combined_score"] = bm25_score * 0.6 + recency_boost * 0.4
+            results.append(d)
+
+        results.sort(key=lambda r: r["_combined_score"], reverse=True)
+        return results[:limit]
+
+    @staticmethod
+    def _extract_search_keywords(text: str) -> list[str]:
+        """Extract meaningful keywords from natural language for FTS5 query."""
+        import re
+        # Strip punctuation
+        text = re.sub(r'[^\w\s]', ' ', text).strip().lower()
+        if not text:
+            return []
+
+        # Stop words — common words that add noise to FTS5 queries
+        stop_words = {
+            "i", "me", "my", "we", "you", "your", "he", "she", "it", "they",
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "can", "may", "might", "shall", "must",
+            "what", "when", "where", "which", "who", "whom", "how", "why",
+            "that", "this", "these", "those", "there", "here",
+            "and", "or", "but", "if", "then", "so", "because", "while",
+            "of", "in", "on", "at", "to", "for", "with", "from", "by", "about",
+            "into", "through", "during", "before", "after", "above", "below",
+            "not", "no", "nor", "very", "just", "also", "than", "too",
+            "said", "say", "tell", "told", "know", "think", "want", "need",
+            "like", "get", "got", "go", "went", "come", "make", "made",
+            "last", "did", "about", "something", "anything",
+        }
+
+        words = text.split()
+        keywords = [w for w in words if w not in stop_words and len(w) > 1]
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                unique.append(kw)
+
+        return unique[:8]  # Cap at 8 keywords to avoid FTS5 query explosion
 
     def get_recent(self, hours: int = 24, limit: int = 50, type: Optional[str] = None) -> list:
         """Get recent memories within the last N hours."""
@@ -242,6 +305,40 @@ class MemorySpine:
         )
         self.conn.commit()
         return cursor.lastrowid
+
+    def store_if_meaningful(
+        self,
+        content: str,
+        type: str = "interaction",
+        source: str = "telegram",
+        entities: Optional[list] = None,
+        metadata: Optional[dict] = None,
+        summary: Optional[str] = None,
+    ) -> Optional[int]:
+        """Store a memory only if it carries meaningful information.
+
+        Skips trivial messages (acknowledgements, single-word reactions, etc.)
+        to keep the memory database high-signal.
+        Returns memory ID or None if skipped.
+        """
+        # Extract the actual message (strip "source: " prefix if present)
+        text = content
+        if ": " in content:
+            text = content.split(": ", 1)[1]
+        text = text.strip().lower()
+
+        # Skip trivial messages
+        trivial_patterns = {
+            "ok", "okay", "sure", "thanks", "thank you", "thx", "ty",
+            "yes", "no", "yep", "nope", "yea", "yeah", "nah",
+            "lol", "haha", "lmao", "nice", "cool", "great", "good",
+            "k", "kk", "hmm", "hm", "ah", "oh", "right",
+            "got it", "sounds good", "will do", "perfect",
+        }
+        if text in trivial_patterns or len(text) < 3:
+            return None
+
+        return self.store(content, type, source, entities, metadata, summary)
 
     def count(self, tier: Optional[str] = None) -> int:
         """Count memories, optionally filtered by tier."""

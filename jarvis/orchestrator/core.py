@@ -1,20 +1,15 @@
 """
-JARVIS Orchestrator — Main event loop, message routing, state management.
+JARVIS Orchestrator — Simplified. Two paths only.
 
-The orchestrator is the central coordinator:
-- Receives messages from Telegram
-- Scores priority
-- Searches memory for relevant context
-- Routes to intelligence layer
-- Dispatches actions (computer use, email, calendar, etc.)
-- Stores interactions in memory
-- Manages JARVIS modes (active, focus, sleep)
+Every message goes through ONE of two paths:
+  1. Instant command (volume, time, open app) — sub-second, no LLM
+  2. Claude via browser — everything else, no exceptions
+
+No action detection. No caching. No complex routing.
+Claude's Cowork handles questions AND Mac control.
 """
 import asyncio
-import hashlib
 import json
-import subprocess
-import time
 from datetime import datetime
 from typing import Optional
 from enum import Enum
@@ -32,177 +27,107 @@ log = get_logger("orchestrator.core")
 
 
 class Mode(Enum):
-    ACTIVE = "active"       # Normal operation, responds to everything
-    FOCUS = "focus"         # Only high-priority messages get through
-    SLEEP = "sleep"         # Only cardiac alerts and emergencies
-    MAINTENANCE = "maintenance"  # System maintenance, limited responses
+    ACTIVE = "active"
+    FOCUS = "focus"
+    SLEEP = "sleep"
 
 
-FOCUS_THRESHOLD = 70  # Minimum priority to break through focus mode
-SLEEP_THRESHOLD = 90  # Minimum priority to break through sleep mode
+FOCUS_THRESHOLD = 70
+SLEEP_THRESHOLD = 90
 
 
 class Orchestrator:
-    """Central coordinator for JARVIS."""
+    """Central coordinator for JARVIS. Two paths: instant || Claude."""
 
     def __init__(self):
         self.spine = MemorySpine()
         self.graph = EntityGraph()
         self.intelligence = Intelligence()
-        self.briefing = BriefingGenerator(self.spine, self.intelligence)
+        self.briefing = BriefingGenerator(self.spine, self.intelligence, self.patterns)
         self.patterns = PatternLearner(self.spine)
 
         self.mode = Mode.ACTIVE
         self.running = False
-        self._action_in_progress = False
         self._stop_event = asyncio.Event()
-        self._cache = {}  # {hash: (response, timestamp)}
-        self._cache_ttl = 300  # 5 minutes
 
         self.send_message_callback = None
         self.send_approval_callback = None
 
     async def initialize(self) -> bool:
         log.info("Initializing JARVIS orchestrator...")
-
         intel_ok = await self.intelligence.initialize()
         if not intel_ok:
             log.warning("Intelligence layer not ready. Operating in limited mode.")
-
         self.running = True
         log.info(f"JARVIS orchestrator initialized. Mode: {self.mode.value}")
         return True
 
     async def handle_message(self, message: str, source: str = "telegram", metadata: Optional[dict] = None) -> str:
-        """Handle an incoming message. Main entry point.
-
-        Args:
-            message: The message text
-            source: Where it came from (telegram, cli, system)
-            metadata: Additional info (chat_id, is_voice, etc.)
-
-        Returns:
-            Response text to send back
-        """
+        """Main entry point. Two paths: instant command or Claude."""
         timestamp = datetime.now().isoformat()
         priority = score_priority(message, metadata)
 
         log.info(f"Message received: priority={priority} source={source} mode={self.mode.value}")
 
-        # STOP command — always handled immediately
+        # ── Always handle: STOP ──
         if is_stop_command(message):
             return await self._handle_stop()
 
-        # Mode filtering
+        # ── Mode gates ──
         if self.mode == Mode.SLEEP and priority < SLEEP_THRESHOLD:
-            log.info("Message suppressed (sleep mode)")
-            return ""  # Silent suppress
+            return ""
         if self.mode == Mode.FOCUS and priority < FOCUS_THRESHOLD:
             return "In focus mode. Only urgent messages get through. Send /active to switch back."
 
-        # Cardiac alert — always process immediately
+        # ── Cardiac alert — log it, then fall through to Claude ──
         if is_cardiac_alert(message):
             log.warning(f"CARDIAC ALERT: {message[:100]}")
 
-        # Track patterns
+        # ── Track patterns + extract entities into graph ──
         self.patterns.record_interaction(message)
-
-        # Store incoming message in memory
-        mem_id = self.spine.store(
+        self._extract_and_store_entities(message)
+        mem_id = self.spine.store_if_meaningful(
             content=f"{source}: {message}",
             type="interaction",
             source=source,
             metadata={"priority": priority, "timestamp": timestamp, **(metadata or {})},
         )
+        if mem_id is None:
+            # Trivial message — still needs a mem_id ref for reply tracking
+            mem_id = -1
 
-        # Handle special commands
+        # ── Slash commands ──
         if message.startswith("/"):
             return await self._handle_command(message)
 
-        # Step 1: Try instant Mac control (sub-second, no LLM)
+        # ── PATH 1: Instant command (sub-second, no LLM) ──
         instant = try_instant_command(message)
         if instant:
             self.spine.store(content=f"JARVIS: {instant}", type="interaction",
                            source="jarvis", metadata={"in_reply_to": mem_id, "instant": True})
             return instant
 
-        # Step 2: Check cache
-        cache_key = hashlib.md5(message.lower().strip().encode()).hexdigest()
-        cached = self._cache.get(cache_key)
-        if cached and time.time() - cached[1] < self._cache_ttl:
-            log.info("Cache hit")
-            return cached[0]
-
-        # Step 3: Check if this is an action → route to Cowork
-        msg_lower = message.lower()
-        action_signals = ["open", "launch", "go to", "click", "type", "send",
-                         "play", "close", "move", "resize", "fill", "submit",
-                         "download", "upload", "screenshot", "check my",
-                         "show me", "find", "navigate", "switch to",
-                         "set up", "log in", "sign in", "create"]
-        is_action = any(msg_lower.startswith(s) or f" {s} " in f" {msg_lower} " for s in action_signals)
-
-        if is_action:
-            try:
-                response = await self.intelligence.think(
-                    f"Use your computer to do this: {message}"
-                )
-                reply = self._exec_do_commands(response)
-                self.spine.store(content=f"JARVIS: {reply}", type="interaction",
-                               source="jarvis", metadata={"in_reply_to": mem_id, "action": True})
-                return reply
-            except Exception as e:
-                log.error(f"Action error: {e}")
-                return f"Couldn't do that, sir: {str(e)[:100]}"
-
-        # Step 4: Regular conversation
-        memory_context = ""
-        if len(message.split()) > 3:
-            memory_context = self._get_relevant_context(message)
+        # ── PATH 2: Claude handles everything else ──
+        memory_context = self._get_relevant_context(message) if len(message.split()) > 3 else ""
         try:
             response = await self.intelligence.think(message=message, memory_context=memory_context)
-            reply = self._exec_do_commands(response)
-            self.spine.store(content=f"JARVIS: {reply}", type="interaction",
+            self.spine.store(content=f"JARVIS: {response}", type="interaction",
                            source="jarvis", metadata={"in_reply_to": mem_id})
-            # Cache non-action responses
-            self._cache[cache_key] = (reply, time.time())
-            return reply
+            return response
         except Exception as e:
-            log.error(f"Intelligence error: {e}")
+            log.error(f"Claude error: {e}")
             return f"Apologies sir, something went wrong: {str(e)[:150]}"
 
-    def _exec_do_commands(self, response: str) -> str:
-        """Execute DO: lines from Claude and return cleaned response."""
-        clean_lines = []
-        for line in response.split("\n"):
-            if line.strip().startswith("DO:"):
-                cmd = line.strip()[3:].strip()
-                log.info(f"Executing: {cmd}")
-                try:
-                    if cmd.startswith("tell ") or cmd.startswith("do "):
-                        subprocess.run(["osascript", "-e", cmd], timeout=10, capture_output=True)
-                    else:
-                        subprocess.run(cmd, shell=True, timeout=10, capture_output=True)
-                except Exception as e:
-                    log.error(f"Exec error: {e}")
-            else:
-                clean_lines.append(line)
-        return "\n".join(clean_lines).strip() or response
+    # ── Internal ──
 
     async def _handle_stop(self) -> str:
-        """Handle STOP/KILL command — halt everything immediately."""
         log.warning("STOP command received — halting all actions")
         self._stop_event.set()
-        self._action_in_progress = False
-
-        # Brief pause then clear
         await asyncio.sleep(0.5)
         self._stop_event.clear()
-
         return "All actions halted. What's happening?"
 
     async def _handle_command(self, message: str) -> str:
-        """Handle slash commands."""
         cmd = message.strip().lower().split()[0]
         args = message.strip()[len(cmd):].strip()
 
@@ -227,25 +152,21 @@ class Orchestrator:
         return f"Unknown command: {cmd}. Available: {', '.join(commands.keys())}"
 
     def _set_mode(self, mode: Mode) -> str:
-        """Switch JARVIS mode."""
         old_mode = self.mode
         self.mode = mode
         log.info(f"Mode changed: {old_mode.value} → {mode.value}")
         return f"Mode: {mode.value}"
 
     def _get_status(self) -> str:
-        """Get current JARVIS status."""
         stats = self.spine.stats()
         return (
             f"Mode: {self.mode.value}\n"
             f"Memories: {stats['total']} (hot: {stats['by_tier'].get('hot', 0)}, "
             f"warm: {stats['by_tier'].get('warm', 0)})\n"
-            f"Entities: {self.graph.stats()['total_entities']}\n"
-            f"Action in progress: {self._action_in_progress}"
+            f"Entities: {self.graph.stats()['total_entities']}"
         )
 
     def _search_memory(self, query: str) -> str:
-        """Search memory and return results."""
         if not query:
             return "Usage: /memory <search query>"
         results = self.spine.search_text(query, limit=5)
@@ -259,7 +180,6 @@ class Orchestrator:
         return "\n".join(lines)
 
     async def _get_stats(self) -> str:
-        """Get detailed stats."""
         mem_stats = self.spine.stats()
         graph_stats = self.graph.stats()
         health = await self.intelligence.health_check()
@@ -270,100 +190,97 @@ class Orchestrator:
         )
 
     def _get_relevant_context(self, message: str, limit: int = 5) -> str:
-        """Search memory for context relevant to the current message."""
-        results = self.spine.search_text(message, limit=limit)
-        if not results:
-            return ""
+        """Build memory context: FTS5 search + recent conversation + entity graph."""
+        parts = []
 
-        lines = []
-        for r in results:
-            tier = r.get("tier", "")
-            content = r.get("summary") or r.get("content", "")
-            lines.append(f"[{tier}] {content[:200]}")
-        return "\n".join(lines)
+        # 1) FTS5 search for topical relevance
+        search_results = self.spine.search_text(message, limit=limit)
+        search_ids = set()
+        if search_results:
+            for r in search_results:
+                search_ids.add(r.get("id"))
+                tier = r.get("tier", "")
+                ts = r.get("timestamp", "")[:16]
+                # Prefer summary for compacted tiers, full content for hot
+                if tier in ("warm", "cold", "archive") and r.get("summary"):
+                    text = r["summary"]
+                else:
+                    text = r.get("content", "")
+                parts.append(f"[{ts} | {tier}] {text[:300]}")
 
-    def _get_state_context(self) -> str:
-        """Get current state as context string."""
-        now = datetime.now()
-        return (
-            f"Time: {now.strftime('%Y-%m-%d %H:%M')} AEST ({now.strftime('%A')})\n"
-            f"Mode: {self.mode.value}\n"
-            f"Action in progress: {self._action_in_progress}"
-        )
+        # 2) Last 3 messages for conversational continuity
+        recent = self.spine.get_recent(hours=1, limit=3, type="interaction")
+        for r in recent:
+            if r.get("id") not in search_ids:
+                text = r.get("content", "")[:200]
+                parts.append(f"[recent] {text}")
 
-    def _parse_response(self, raw: str) -> dict:
-        """Parse Claude's structured JSON response.
+        # 3) Entity graph enrichment (best-effort)
+        try:
+            topics = self.patterns._extract_topics(message)
+            for topic in topics[:3]:
+                connected = self.graph.get_connected_entities(topic, max_depth=1)
+                if connected:
+                    names = ", ".join(list(connected)[:5])
+                    parts.append(f"[graph] {topic} relates to: {names}")
+        except Exception:
+            pass
 
-        Falls back gracefully if response isn't valid JSON.
+        return "\n".join(parts) if parts else ""
+
+    def _extract_and_store_entities(self, message: str):
+        """Extract entities from message and update the entity graph.
+
+        Uses the pattern learner's topic extraction + simple proper noun detection.
         """
-        # Try to extract JSON from the response
         try:
-            # Direct JSON parse
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
+            # Known topics (financial instruments, domains)
+            topics = self.patterns._extract_topics(message)
+            for topic in topics:
+                entity_type = "topic"
+                if topic.isupper() and len(topic) <= 5:
+                    entity_type = "instrument"
+                self.graph.add_entity(topic, entity_type=entity_type)
 
-        # Try to find JSON block in the response
-        try:
-            start = raw.index("{")
-            end = raw.rindex("}") + 1
-            return json.loads(raw[start:end])
-        except (ValueError, json.JSONDecodeError):
-            pass
+            # Co-occurrence: if multiple entities in one message, they're related
+            if len(topics) > 1:
+                for i in range(len(topics)):
+                    for j in range(i + 1, len(topics)):
+                        self.graph.add_relation(
+                            topics[i], topics[j],
+                            relation_type="co_mentioned",
+                            weight=0.5,
+                        )
 
-        # Fallback: treat entire response as the reply
-        return {
-            "reply": raw,
-            "action": None,
-            "remember": None,
-            "mood": "unknown",
-        }
+            # Simple proper noun detection (capitalised words not at sentence start)
+            import re
+            words = message.split()
+            for idx, word in enumerate(words):
+                clean = re.sub(r'[^\w]', '', word)
+                if (clean and clean[0].isupper() and len(clean) > 2
+                        and idx > 0 and clean.lower() not in {"the", "and", "but", "for"}):
+                    self.graph.add_entity(clean, entity_type="person_or_place")
 
-    async def _handle_action(self, action: dict):
-        """Dispatch an action to the appropriate handler."""
-        action_type = action.get("type", "")
-        details = action.get("details", "")
-        log.info(f"Action requested: {action_type} — {details[:100]}")
-
-        # Store action in memory
-        self.spine.store(
-            content=f"Action: {action_type} — {details}",
-            type="action",
-            source="orchestrator",
-            metadata=action,
-        )
-
-        # TODO: Route to computer use agent, email handler, etc.
-        # This will be implemented in Phase 6 (Computer Use Agent)
+        except Exception as e:
+            log.debug(f"Entity extraction error (non-fatal): {e}")
 
     async def _morning_briefing_job(self) -> str:
-        """Morning briefing scheduled job."""
         log.info("Generating morning briefing...")
         briefing = await self.briefing.morning_briefing()
-
-        # Store in memory
         self.spine.store(content=briefing, type="briefing", source="system")
-
-        # Send via callback if registered
         if self.send_message_callback:
             await self.send_message_callback(briefing)
-
         return briefing
 
     async def _evening_review_job(self) -> str:
-        """Evening review scheduled job."""
         log.info("Generating evening review...")
         review = await self.briefing.evening_review()
-
         self.spine.store(content=review, type="briefing", source="system")
-
         if self.send_message_callback:
             await self.send_message_callback(review)
-
         return review
 
     async def shutdown(self):
-        """Clean shutdown."""
         log.info("Shutting down orchestrator...")
         self.running = False
         await self.intelligence.shutdown()

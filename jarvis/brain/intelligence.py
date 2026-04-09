@@ -1,6 +1,9 @@
 """
-Intelligence Layer — Claude browser, single session, context once.
-Instant commands bypass this entirely (handled by instant_mac.py).
+Intelligence Layer — Claude browser with Cowork, single session.
+
+Everything routes here except instant commands (volume, time, open app).
+Claude's Cowork feature handles both conversation AND Mac control.
+No DO: lines. No action detection. Claude uses computer_use directly.
 """
 from jarvis.identity.loader import get_user_name, get_user_first_name, get_identity_string
 from jarvis.utils.logger import get_logger
@@ -23,9 +26,11 @@ class Intelligence:
             f"Call the user 'sir' occasionally. 1-3 sentences max. "
             f"Never say anything about your thinking process. Just answer.\n\n"
             f"User:\n{identity}\n\n"
-            f"If asked to do something on Mac, respond with:\n"
-            f"DO: <applescript command>\nThen a brief confirmation.\n"
-            f"Otherwise just respond naturally. No JSON. No markdown. No fluff."
+            f"You have full computer use via Cowork. If the user asks you to do "
+            f"something on their Mac — open apps, click things, fill forms, send "
+            f"emails, check calendar — just do it directly using your computer tools. "
+            f"No need to explain what you're doing. Just do it and confirm briefly.\n"
+            f"For questions, just respond naturally. No JSON. No markdown. No fluff."
         )
 
     async def initialize(self) -> bool:
@@ -49,7 +54,13 @@ class Intelligence:
 
         prompt = message
         if memory_context:
-            prompt = f"(Context: {memory_context[:300]})\n{message}"
+            # Give Claude structured memory context — up to 1500 chars
+            # (enough for 5 memories at 300 chars each)
+            ctx = memory_context[:1500]
+            prompt = (
+                f"[Memory — previous interactions and knowledge]\n{ctx}\n"
+                f"[End memory]\n\n{message}"
+            )
 
         try:
             raw = await self._browser.think_in_conversation(prompt)

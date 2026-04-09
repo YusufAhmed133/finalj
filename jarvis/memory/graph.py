@@ -24,17 +24,26 @@ class EntityGraph:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.entities: dict = {}     # name -> {type, attributes, first_seen, last_seen, mention_count}
         self.relations: list = []    # [{source, target, type, weight, timestamp}]
+        self._adj: dict = {}         # entity_key -> set of relation indices (for O(1) lookup)
         self._load()
 
     def _load(self):
-        """Load graph from disk."""
+        """Load graph from disk and rebuild adjacency index."""
         if self.path.exists():
             data = json.loads(self.path.read_text())
             self.entities = data.get("entities", {})
             self.relations = data.get("relations", [])
+            self._rebuild_adj()
             log.info(f"Loaded graph: {len(self.entities)} entities, {len(self.relations)} relations")
         else:
             log.info("No existing graph found, starting fresh")
+
+    def _rebuild_adj(self):
+        """Rebuild adjacency index from relations list."""
+        self._adj = {}
+        for idx, rel in enumerate(self.relations):
+            self._adj.setdefault(rel["source"], set()).add(idx)
+            self._adj.setdefault(rel["target"], set()).add(idx)
 
     def _save(self):
         """Persist graph to disk."""
@@ -81,6 +90,7 @@ class EntityGraph:
                 self._save()
                 return
 
+        idx = len(self.relations)
         self.relations.append({
             "source": source_key,
             "target": target_key,
@@ -88,6 +98,8 @@ class EntityGraph:
             "weight": weight,
             "timestamp": time.time(),
         })
+        self._adj.setdefault(source_key, set()).add(idx)
+        self._adj.setdefault(target_key, set()).add(idx)
         self._save()
 
     def get_entity(self, name: str) -> Optional[dict]:
@@ -95,12 +107,13 @@ class EntityGraph:
         return self.entities.get(name.lower().strip())
 
     def get_relations(self, entity_name: str) -> list:
-        """Get all relations involving an entity."""
+        """Get all relations involving an entity. Uses adjacency index."""
         key = entity_name.lower().strip()
-        return [r for r in self.relations if r["source"] == key or r["target"] == key]
+        indices = self._adj.get(key, set())
+        return [self.relations[i] for i in indices if i < len(self.relations)]
 
     def get_connected_entities(self, entity_name: str, max_depth: int = 2) -> set:
-        """BFS to find entities connected within N hops."""
+        """BFS to find entities connected within N hops. Uses adjacency index."""
         key = entity_name.lower().strip()
         visited = set()
         queue = [(key, 0)]
@@ -111,11 +124,13 @@ class EntityGraph:
                 continue
             visited.add(current)
 
-            for rel in self.relations:
-                if rel["source"] == current and rel["target"] not in visited:
-                    queue.append((rel["target"], depth + 1))
-                elif rel["target"] == current and rel["source"] not in visited:
-                    queue.append((rel["source"], depth + 1))
+            for idx in self._adj.get(current, set()):
+                if idx >= len(self.relations):
+                    continue
+                rel = self.relations[idx]
+                neighbor = rel["target"] if rel["source"] == current else rel["source"]
+                if neighbor not in visited:
+                    queue.append((neighbor, depth + 1))
 
         visited.discard(key)
         return visited

@@ -96,8 +96,30 @@ class PatternLearner:
     def get_quiet_hours(self) -> dict:
         return self.prefs.get("quiet_hours", {})
 
+    def weekly_decay(self):
+        """Decay weekly counters instead of hard reset. Call every Monday.
+
+        Halves all counts instead of zeroing — preserves long-term patterns
+        while letting stale topics fade out naturally.
+        """
+        counts = self.prefs.get("topic_counts", {})
+        decayed = {}
+        for topic, count in counts.items():
+            new_count = count // 2
+            if new_count > 0:
+                decayed[topic] = new_count
+        self.prefs["topic_counts"] = decayed
+
+        # Also prune auto_briefing topics that have fully decayed
+        auto = self.prefs.get("auto_briefing", [])
+        self.prefs["auto_briefing"] = [t for t in auto if t in decayed]
+
+        # Run quiet hours detection while we're at it
+        self.detect_quiet_hours()
+        self._save()
+
     def weekly_reset(self):
-        """Reset weekly counters (call every Monday)."""
+        """Hard reset — only for explicit user request. Prefer weekly_decay()."""
         self.prefs["topic_counts"] = {}
         self._save()
 
