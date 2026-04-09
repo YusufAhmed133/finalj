@@ -1,24 +1,18 @@
 """
-JARVIS Voice Interface — Iron Man orb at localhost:7777.
+JARVIS Voice Interface — Arc Reactor UI at localhost:7777.
 
-Architecture:
-  Browser: Silero VAD (neural speech detection) → sends audio on speech end
-  Server: Whisper transcribes → orchestrator routes → edge-tts generates audio
-  Browser: plays audio, pauses VAD during playback to prevent echo loop
-
+Uses browser-native Web Speech API for instant transcription (no Whisper delay).
+edge-tts en-GB-RyanNeural for JARVIS voice.
 Admin dashboard at /admin.
 """
 import asyncio
-import base64
 import json
-import subprocess
-import tempfile
 import uuid
 from pathlib import Path
 from typing import Optional, Callable
 
 import edge_tts
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 
 from jarvis.utils.logger import get_logger
@@ -28,7 +22,6 @@ log = get_logger("voice.server")
 app = FastAPI(title="JARVIS")
 
 _message_handler: Optional[Callable] = None
-_whisper_model = None
 _spine_ref = None
 _graph_ref = None
 
@@ -47,357 +40,44 @@ def set_data(spine, graph):
     _spine_ref = spine
     _graph_ref = graph
 
-def _get_whisper():
-    global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        log.info("Whisper loaded")
-    return _whisper_model
-
-
-# ─── TTS endpoint ────────────────────────────────────────────────
 
 @app.post("/api/tts")
 async def tts_endpoint(request: Request):
-    """Generate JARVIS speech audio. Returns audio/mpeg file."""
     body = await request.json()
-    text = body.get("text", "")
+    text = body.get("text", "").strip()
     if not text:
         return JSONResponse({"error": "no text"}, 400)
-
-    filename = TTS_DIR / f"jarvis_{uuid.uuid4().hex[:8]}.mp3"
-    communicate = edge_tts.Communicate(text, voice=JARVIS_VOICE, rate="+5%", pitch="-2Hz")
+    # Clean response — remove thinking/meta artifacts
+    for prefix in ["Thinking", "Processing", "Let me", "Hmm,"]:
+        if text.startswith(prefix) and "..." in text[:50]:
+            text = text[text.index("...") + 3:].strip()
+    filename = TTS_DIR / f"j_{uuid.uuid4().hex[:8]}.mp3"
+    communicate = edge_tts.Communicate(text[:800], voice=JARVIS_VOICE, rate="+5%", pitch="-2Hz")
     await communicate.save(str(filename))
     return FileResponse(str(filename), media_type="audio/mpeg")
 
 
-# ─── Transcription endpoint ─────────────────────────────────────
-
-@app.post("/api/transcribe")
-async def transcribe_endpoint(request: Request):
-    """Transcribe audio. Accepts base64 WAV in JSON body."""
-    body = await request.json()
-    audio_b64 = body.get("audio", "")
-    if not audio_b64:
-        return JSONResponse({"text": ""})
-
-    audio_bytes = base64.b64decode(audio_b64)
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp.write(audio_bytes)
-    tmp.close()
-
-    try:
-        model = _get_whisper()
-        segments, _ = model.transcribe(tmp.name, language="en", beam_size=5)
-        text = " ".join(s.text.strip() for s in segments).strip()
-    except Exception as e:
-        log.error(f"Transcription error: {e}")
-        text = ""
-    finally:
-        Path(tmp.name).unlink(missing_ok=True)
-
-    return JSONResponse({"text": text})
-
-
-# ─── Chat endpoint ──────────────────────────────────────────────
-
 @app.post("/api/chat")
 async def chat_endpoint(request: Request):
-    """Send message through orchestrator."""
     body = await request.json()
-    text = body.get("text", "")
+    text = body.get("text", "").strip()
     if not text or not _message_handler:
         return JSONResponse({"response": "Not connected."})
-
     try:
         response = await _message_handler(message=text, source="voice", metadata={"is_voice": True})
+        # Clean any thinking artifacts from response
+        if response:
+            for noise in ["Thinking...", "Processing...", "Let me think..."]:
+                response = response.replace(noise, "").strip()
     except Exception as e:
         response = f"Error: {str(e)[:200]}"
+    return JSONResponse({"response": response or "No response."})
 
-    return JSONResponse({"response": response})
-
-
-# ─── Main page: JARVIS Orb ──────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """<!DOCTYPE html>
-<html>
-<head>
-<title>J.A.R.V.I.S.</title>
-<meta charset="utf-8">
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-:root {
-    --jarvis: #00d4ff;
-    --glow: rgba(0, 212, 255, 0.4);
-    --bg: #0a0e17;
-}
-body {
-    background: var(--bg); overflow: hidden;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    height: 100vh; font-family: 'Courier New', monospace;
-    color: var(--jarvis); user-select: none;
-}
+    return ARC_REACTOR_HTML
 
-/* Orb container */
-.jarvis-container {
-    position: relative; width: 220px; height: 220px;
-}
-
-/* Rotating rings */
-.ring {
-    position: absolute; inset: 0;
-    border: 2px solid rgba(0, 212, 255, 0.15);
-    border-top: 2px solid var(--jarvis);
-    border-radius: 50%;
-    animation: ring-spin 4s linear infinite;
-}
-.ring:nth-child(2) { inset: 18px; animation-duration: 6s; animation-direction: reverse; border-top-color: rgba(0,212,255,0.6); }
-.ring:nth-child(3) { inset: 36px; animation-duration: 3s; border-top-color: rgba(0,212,255,0.4); }
-
-/* Core orb */
-.orb {
-    position: absolute; inset: 55px; border-radius: 50%;
-    background: radial-gradient(circle at 40% 40%, rgba(0,212,255,0.8), rgba(0,100,200,0.4) 50%, rgba(0,50,100,0.1) 70%, transparent);
-    box-shadow: 0 0 30px var(--glow), 0 0 60px rgba(0,212,255,0.2), inset 0 0 30px rgba(0,212,255,0.1);
-    animation: orb-idle 3s ease-in-out infinite;
-    transition: all 0.3s ease;
-}
-
-/* States */
-.orb.listening {
-    animation: orb-listen 0.8s ease-in-out infinite;
-    box-shadow: 0 0 50px rgba(0,212,255,0.6), 0 0 100px rgba(0,212,255,0.3), inset 0 0 40px rgba(0,212,255,0.2);
-}
-.orb.thinking {
-    animation: orb-think 1.5s ease-in-out infinite;
-    background: radial-gradient(circle at 40% 40%, rgba(255,183,77,0.9), rgba(245,124,0,0.5) 50%, transparent);
-    box-shadow: 0 0 50px rgba(255,183,77,0.5), 0 0 100px rgba(255,183,77,0.2);
-}
-.orb.speaking {
-    animation: orb-speak 0.15s ease-in-out infinite alternate;
-    background: radial-gradient(circle at 40% 40%, rgba(0,255,200,0.9), rgba(0,200,255,0.5) 50%, transparent);
-    box-shadow: 0 0 60px rgba(0,255,200,0.5), 0 0 120px rgba(0,212,255,0.3);
-}
-.orb.muted {
-    background: radial-gradient(circle at 40% 40%, #444, #222, #111);
-    box-shadow: 0 0 20px rgba(100,100,100,0.2);
-    animation: none;
-}
-
-@keyframes ring-spin { to { transform: rotate(360deg); } }
-@keyframes orb-idle { 0%,100% { transform: scale(1); opacity: 0.8; } 50% { transform: scale(1.04); opacity: 1; } }
-@keyframes orb-listen { 0%,100% { transform: scale(1); } 50% { transform: scale(1.12); } }
-@keyframes orb-think { 0%,100% { transform: scale(1) rotate(0deg); } 50% { transform: scale(1.06) rotate(180deg); } }
-@keyframes orb-speak { from { transform: scale(1); } to { transform: scale(1.06); } }
-
-/* Scan lines */
-.jarvis-container::after {
-    content: ''; position: absolute; inset: -50px;
-    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,212,255,0.02) 2px, rgba(0,212,255,0.02) 4px);
-    pointer-events: none; border-radius: 50%;
-}
-
-#status {
-    margin-top: 30px; font-size: 11px; letter-spacing: 4px;
-    text-transform: uppercase; opacity: 0.6;
-}
-#transcript {
-    position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
-    max-width: 600px; text-align: center; font-size: 14px; color: #556; opacity: 0.8;
-}
-#response {
-    position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
-    max-width: 700px; text-align: center; font-size: 16px; color: var(--jarvis);
-    line-height: 1.4;
-}
-#nav { position: fixed; top: 15px; right: 20px; font-size: 11px; }
-#nav a { color: rgba(0,212,255,0.4); text-decoration: none; letter-spacing: 2px; }
-#nav a:hover { color: var(--jarvis); }
-</style>
-</head>
-<body>
-<div id="nav"><a href="/admin">ADMIN</a></div>
-
-<div class="jarvis-container">
-    <div class="ring"></div>
-    <div class="ring"></div>
-    <div class="ring"></div>
-    <div class="orb" id="orb"></div>
-</div>
-<div id="status">INITIALIZING</div>
-<div id="transcript"></div>
-<div id="response"></div>
-
-<!-- Silero VAD for neural speech detection -->
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.19/dist/bundle.min.js"></script>
-
-<script>
-const orb = document.getElementById('orb');
-const statusEl = document.getElementById('status');
-const transcriptEl = document.getElementById('transcript');
-const responseEl = document.getElementById('response');
-
-let currentAudio = null;
-let vadInstance = null;
-let isMuted = false;
-
-function setState(state) {
-    orb.className = 'orb ' + state;
-    statusEl.textContent = state.toUpperCase() || 'STANDBY';
-}
-
-// Convert Float32Array (16kHz mono) to WAV blob
-function float32ToWav(samples, sr) {
-    const buf = new ArrayBuffer(44 + samples.length * 2);
-    const v = new DataView(buf);
-    const ws = (o, s) => { for(let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
-    ws(0,'RIFF'); v.setUint32(4, 36+samples.length*2, true);
-    ws(8,'WAVE'); ws(12,'fmt '); v.setUint32(16,16,true);
-    v.setUint16(20,1,true); v.setUint16(22,1,true);
-    v.setUint32(24,sr,true); v.setUint32(28,sr*2,true);
-    v.setUint16(32,2,true); v.setUint16(34,16,true);
-    ws(36,'data'); v.setUint32(40,samples.length*2,true);
-    for(let i=0;i<samples.length;i++) {
-        const s = Math.max(-1, Math.min(1, samples[i]));
-        v.setInt16(44+i*2, s<0?s*0x8000:s*0x7FFF, true);
-    }
-    return new Blob([buf], {type:'audio/wav'});
-}
-
-async function handleSpeech(audio) {
-    // audio = Float32Array from Silero VAD at 16kHz
-    setState('thinking');
-    transcriptEl.textContent = 'Processing...';
-
-    // Convert to WAV and base64
-    const wavBlob = float32ToWav(audio, 16000);
-    const reader = new FileReader();
-    const b64 = await new Promise(resolve => {
-        reader.onload = () => resolve(reader.result.split(',')[1]);
-        reader.readAsDataURL(wavBlob);
-    });
-
-    // Transcribe
-    let text = '';
-    try {
-        const res = await fetch('/api/transcribe', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({audio: b64})
-        });
-        const data = await res.json();
-        text = data.text || '';
-    } catch(e) {
-        console.error('Transcribe error:', e);
-        setState('listening');
-        return;
-    }
-
-    if (!text || text.trim().length < 2) {
-        setState('listening');
-        transcriptEl.textContent = '';
-        return;
-    }
-
-    // Check voice commands
-    const lower = text.toLowerCase().trim();
-    if (lower.includes('jarvis mute') || lower === 'mute') {
-        isMuted = true;
-        setState('muted');
-        transcriptEl.textContent = '';
-        return;
-    }
-    if (lower.includes('jarvis unmute') || lower === 'unmute') {
-        isMuted = false;
-        setState('listening');
-        transcriptEl.textContent = '';
-        return;
-    }
-
-    transcriptEl.textContent = text;
-
-    // Get response from JARVIS
-    let response = '';
-    try {
-        const res = await fetch('/api/chat', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({text})
-        });
-        const data = await res.json();
-        response = data.response || 'No response.';
-    } catch(e) {
-        response = 'Connection error.';
-    }
-
-    responseEl.textContent = response.substring(0, 400);
-
-    // Speak the response — PAUSE VAD first to prevent echo
-    if (vadInstance) vadInstance.pause();
-    setState('speaking');
-
-    try {
-        const ttsRes = await fetch('/api/tts', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({text: response.substring(0, 500)})
-        });
-        const audioBlob = await ttsRes.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        currentAudio = new Audio(audioUrl);
-        currentAudio.play();
-
-        await new Promise(resolve => {
-            currentAudio.addEventListener('ended', resolve);
-            currentAudio.addEventListener('error', resolve);
-        });
-    } catch(e) {
-        console.error('TTS error:', e);
-    }
-
-    // Resume VAD after TTS + buffer
-    await new Promise(r => setTimeout(r, 600));
-    if (vadInstance && !isMuted) vadInstance.start();
-    setState('listening');
-    setTimeout(() => { responseEl.textContent = ''; transcriptEl.textContent = ''; }, 5000);
-}
-
-async function init() {
-    setState('initializing');
-    try {
-        vadInstance = await vad.MicVAD.new({
-            positiveSpeechThreshold: 0.85,
-            negativeSpeechThreshold: 0.35,
-            minSpeechFrames: 5,
-            preSpeechPadFrames: 10,
-            redemptionFrames: 8,
-            onSpeechStart: () => {
-                if (!isMuted) setState('listening');
-            },
-            onSpeechEnd: (audio) => {
-                if (!isMuted) handleSpeech(audio);
-            },
-        });
-        vadInstance.start();
-        setState('listening');
-    } catch(e) {
-        console.error('VAD init error:', e);
-        statusEl.textContent = 'MIC ACCESS REQUIRED';
-    }
-}
-
-init();
-</script>
-</body>
-</html>"""
-
-
-# ─── Admin Dashboard ─────────────────────────────────────────────
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin():
@@ -414,7 +94,7 @@ async def admin():
         rows += f'<tr><td>{m.get("tier","?")}</td><td>{m.get("type","?")}</td><td>{c}</td></tr>'
     return f"""<!DOCTYPE html><html><head><title>JARVIS Admin</title>
 <style>body{{background:#0a0e17;color:#e0e0e0;font-family:'Courier New',monospace;padding:20px}}
-h1{{color:#00d4ff}}h2{{color:#81c784;border-bottom:1px solid #1a2030;padding-bottom:5px}}
+h1{{color:#00d4ff}}h2{{color:#4fc3f7;border-bottom:1px solid #1a2030;padding-bottom:5px}}
 table{{width:100%;border-collapse:collapse;font-size:0.85em}}
 th,td{{text-align:left;padding:6px 10px;border-bottom:1px solid #1a2030}}th{{color:#556}}
 .stat{{font-size:2.5em;color:#00d4ff;font-weight:bold}}
@@ -424,11 +104,11 @@ a{{color:#00d4ff;text-decoration:none}}
 <h1><a href="/">← J.A.R.V.I.S.</a> // ADMIN</h1>
 <div class="grid">
 <div class="card"><h2>MEMORY</h2><div class="stat">{mem['total']}</div>
-<p>Hot: {mem['by_tier'].get('hot',0)} | Warm: {mem['by_tier'].get('warm',0)} | Cold: {mem['by_tier'].get('cold',0)} | Archive: {mem['by_tier'].get('archive',0)}</p></div>
+<p>Hot:{mem['by_tier'].get('hot',0)} Warm:{mem['by_tier'].get('warm',0)} Cold:{mem['by_tier'].get('cold',0)} Archive:{mem['by_tier'].get('archive',0)}</p></div>
 <div class="card"><h2>ENTITIES</h2><div class="stat">{gs['total_entities']}</div><p>{gs['total_relations']} relations</p></div></div>
-<h2>RECENT ACTIVITY</h2><table><tr><th>Tier</th><th>Type</th><th>Content</th></tr>{rows}</table>
-<h2>SEARCH</h2><form action="/admin/search"><input name="q" placeholder="Search memories..." style="padding:8px;width:300px;background:#0d1117;border:1px solid #1a2030;color:#e0e0e0;border-radius:4px;font-family:monospace">
-<button style="padding:8px 16px;background:#00d4ff;color:#000;border:none;border-radius:4px;cursor:pointer;font-family:monospace">SEARCH</button></form></body></html>"""
+<h2>RECENT</h2><table><tr><th>Tier</th><th>Type</th><th>Content</th></tr>{rows}</table>
+<h2>SEARCH</h2><form action="/admin/search"><input name="q" placeholder="Search..." style="padding:8px;width:300px;background:#0d1117;border:1px solid #1a2030;color:#e0e0e0;border-radius:4px;font-family:monospace">
+<button style="padding:8px 16px;background:#00d4ff;color:#000;border:none;border-radius:4px">SEARCH</button></form></body></html>"""
 
 @app.get("/admin/search", response_class=HTMLResponse)
 async def admin_search(q: str = ""):
@@ -440,9 +120,346 @@ async def admin_search(q: str = ""):
 <style>body{{background:#0a0e17;color:#e0e0e0;font-family:monospace;padding:20px}}
 h1{{color:#00d4ff}}table{{width:100%;border-collapse:collapse}}
 th,td{{text-align:left;padding:6px;border-bottom:1px solid #1a2030}}a{{color:#00d4ff}}</style></head><body>
-<h1><a href="/admin">← ADMIN</a> // SEARCH: {q}</h1><p>{len(results)} results</p>
+<h1><a href="/admin">←</a> SEARCH: {q}</h1><p>{len(results)} results</p>
 <table><tr><th>Tier</th><th>Content</th></tr>{rows}</table></body></html>"""
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": "3.0"}
+
+
+# ─── Arc Reactor UI ──────────────────────────────────────────────
+
+ARC_REACTOR_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<title>J.A.R.V.I.S.</title>
+<meta charset="utf-8">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+    background: #070b14; overflow: hidden;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    height: 100vh; font-family: 'Courier New', monospace;
+    color: #00d4ff;
+}
+
+/* Arc reactor container */
+.reactor {
+    position: relative; width: 400px; height: 400px;
+    display: flex; align-items: center; justify-content: center;
+}
+
+/* Concentric rings */
+.ring {
+    position: absolute; border-radius: 50%;
+    border: 1px solid rgba(0,180,255,0.2);
+}
+.ring-1 { width: 380px; height: 380px; border-width: 2px; border-color: rgba(0,180,255,0.15); animation: spin 20s linear infinite; }
+.ring-2 { width: 320px; height: 320px; border-width: 2px; border-style: dashed; border-color: rgba(0,180,255,0.25); animation: spin 15s linear infinite reverse; }
+.ring-3 { width: 260px; height: 260px; border-width: 3px; border-color: rgba(0,200,255,0.3); animation: spin 10s linear infinite; }
+.ring-4 { width: 200px; height: 200px; border-width: 2px; border-style: dotted; border-color: rgba(0,212,255,0.35); animation: spin 8s linear infinite reverse; }
+.ring-5 { width: 150px; height: 150px; border-width: 3px; border-color: rgba(0,220,255,0.5); animation: spin 5s linear infinite; }
+
+/* Tick marks on rings */
+.ring-1::before, .ring-3::before {
+    content: ''; position: absolute; top: -1px; left: 50%;
+    width: 2px; height: 12px; background: rgba(0,212,255,0.5);
+    transform: translateX(-50%);
+}
+.ring-1::after, .ring-3::after {
+    content: ''; position: absolute; bottom: -1px; left: 50%;
+    width: 2px; height: 12px; background: rgba(0,212,255,0.5);
+    transform: translateX(-50%);
+}
+
+/* Data segments on outer ring */
+.data-seg {
+    position: absolute; font-size: 7px; letter-spacing: 2px;
+    color: rgba(0,180,255,0.4);
+}
+.data-seg.top { top: 5px; }
+.data-seg.bottom { bottom: 5px; }
+.data-seg.left { left: -10px; top: 50%; transform: rotate(-90deg); }
+.data-seg.right { right: -10px; top: 50%; transform: rotate(90deg); }
+
+/* Core glow */
+.core {
+    width: 100px; height: 100px; border-radius: 50%;
+    background: radial-gradient(circle, rgba(0,220,255,0.6) 0%, rgba(0,150,255,0.2) 50%, transparent 70%);
+    box-shadow: 0 0 40px rgba(0,200,255,0.3), 0 0 80px rgba(0,180,255,0.15);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 10; position: relative;
+    transition: all 0.4s ease;
+}
+.core-text {
+    font-size: 11px; letter-spacing: 5px; font-weight: bold;
+    color: rgba(0,220,255,0.9); text-shadow: 0 0 10px rgba(0,200,255,0.5);
+}
+
+/* Waveform bars around core */
+.wave-container {
+    position: absolute; width: 130px; height: 130px;
+    display: flex; align-items: center; justify-content: center;
+    z-index: 5;
+}
+.wave-bar {
+    position: absolute; width: 2px; background: rgba(0,200,255,0.4);
+    transform-origin: center 65px; border-radius: 1px;
+    transition: height 0.1s ease, background 0.3s ease;
+}
+
+/* States */
+.reactor.listening .core {
+    box-shadow: 0 0 60px rgba(0,200,255,0.5), 0 0 120px rgba(0,180,255,0.25);
+}
+.reactor.listening .wave-bar { background: rgba(0,200,255,0.7); }
+.reactor.listening .ring { border-color: rgba(0,200,255,0.4); }
+
+.reactor.thinking .core {
+    background: radial-gradient(circle, rgba(255,180,50,0.6) 0%, rgba(255,120,0,0.2) 50%, transparent 70%);
+    box-shadow: 0 0 60px rgba(255,150,0,0.4), 0 0 100px rgba(255,120,0,0.2);
+}
+.reactor.thinking .wave-bar { background: rgba(255,180,50,0.6); }
+.reactor.thinking .ring { border-color: rgba(255,180,50,0.3); }
+.reactor.thinking .core-text { color: rgba(255,200,100,0.9); }
+
+.reactor.speaking .core {
+    background: radial-gradient(circle, rgba(0,255,180,0.6) 0%, rgba(0,200,150,0.2) 50%, transparent 70%);
+    box-shadow: 0 0 60px rgba(0,255,180,0.4), 0 0 100px rgba(0,220,150,0.2);
+}
+.reactor.speaking .wave-bar { background: rgba(0,255,180,0.7); }
+.reactor.speaking .ring { border-color: rgba(0,255,180,0.3); }
+.reactor.speaking .core-text { color: rgba(0,255,180,0.9); }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Status + text */
+#status {
+    margin-top: 25px; font-size: 10px; letter-spacing: 5px;
+    text-transform: uppercase; opacity: 0.5;
+}
+#transcript {
+    position: fixed; bottom: 70px; left: 50%; transform: translateX(-50%);
+    max-width: 600px; text-align: center; font-size: 13px;
+    color: rgba(0,180,255,0.5); opacity: 0.7;
+}
+#response {
+    position: fixed; bottom: 25px; left: 50%; transform: translateX(-50%);
+    max-width: 700px; text-align: center; font-size: 15px;
+    color: #00d4ff; line-height: 1.4;
+}
+#nav { position: fixed; top: 12px; right: 18px; font-size: 10px; letter-spacing: 3px; }
+#nav a { color: rgba(0,180,255,0.3); text-decoration: none; }
+#nav a:hover { color: #00d4ff; }
+
+/* Scan lines */
+body::after {
+    content: ''; position: fixed; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,180,255,0.015) 3px, rgba(0,180,255,0.015) 6px);
+    pointer-events: none; z-index: 100;
+}
+</style>
+</head>
+<body>
+<div id="nav"><a href="/admin">ADMIN</a></div>
+
+<div class="reactor" id="reactor">
+    <div class="ring ring-1">
+        <span class="data-seg top">0010110100</span>
+        <span class="data-seg bottom">1101001011</span>
+    </div>
+    <div class="ring ring-2"></div>
+    <div class="ring ring-3">
+        <span class="data-seg left">SYSTEMS</span>
+        <span class="data-seg right">ONLINE</span>
+    </div>
+    <div class="ring ring-4"></div>
+    <div class="ring ring-5"></div>
+    <div class="wave-container" id="waveContainer"></div>
+    <div class="core"><span class="core-text">J.A.R.V.I.S</span></div>
+</div>
+<div id="status">STANDBY</div>
+<div id="transcript"></div>
+<div id="response"></div>
+
+<script>
+const reactor = document.getElementById('reactor');
+const statusEl = document.getElementById('status');
+const transcriptEl = document.getElementById('transcript');
+const responseEl = document.getElementById('response');
+const waveContainer = document.getElementById('waveContainer');
+
+// Create waveform bars around the core
+const NUM_BARS = 36;
+const bars = [];
+for (let i = 0; i < NUM_BARS; i++) {
+    const bar = document.createElement('div');
+    bar.className = 'wave-bar';
+    bar.style.transform = `rotate(${i * (360/NUM_BARS)}deg)`;
+    bar.style.height = '3px';
+    bar.style.top = '0px';
+    waveContainer.appendChild(bar);
+    bars.push(bar);
+}
+
+let audioContext, analyser, micStream;
+let isProcessing = false;
+let recognition;
+
+function setState(state) {
+    reactor.className = 'reactor ' + state;
+    statusEl.textContent = state.toUpperCase() || 'STANDBY';
+}
+
+// Animate wave bars from mic input
+function animateWaves() {
+    if (!analyser) { requestAnimationFrame(animateWaves); return; }
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(data);
+    for (let i = 0; i < NUM_BARS; i++) {
+        const idx = Math.floor(i * data.length / NUM_BARS);
+        const val = data[idx] / 255;
+        bars[i].style.height = (3 + val * 25) + 'px';
+    }
+    requestAnimationFrame(animateWaves);
+}
+
+// Use Web Speech API — instant, accurate, no server round-trip
+function startListening() {
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+        statusEl.textContent = 'SPEECH API NOT SUPPORTED';
+        return;
+    }
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-AU';
+
+    let finalTranscript = '';
+    let silenceTimeout;
+
+    recognition.onresult = (event) => {
+        if (isProcessing) return;
+        let interim = '';
+        finalTranscript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            if (event.results[i].isFinal) {
+                finalTranscript += event.results[i][0].transcript;
+            } else {
+                interim += event.results[i][0].transcript;
+            }
+        }
+
+        if (interim) {
+            setState('listening');
+            transcriptEl.textContent = interim;
+        }
+
+        if (finalTranscript.trim()) {
+            clearTimeout(silenceTimeout);
+            silenceTimeout = setTimeout(() => {
+                if (finalTranscript.trim().length > 1 && !isProcessing) {
+                    processCommand(finalTranscript.trim());
+                }
+            }, 800);
+        }
+    };
+
+    recognition.onend = () => {
+        if (!isProcessing) {
+            recognition.start(); // Auto-restart
+        }
+    };
+
+    recognition.onerror = (e) => {
+        if (e.error !== 'no-speech' && e.error !== 'aborted') {
+            console.error('Speech error:', e.error);
+        }
+    };
+
+    recognition.start();
+    setState('listening');
+}
+
+async function processCommand(text) {
+    isProcessing = true;
+    recognition.stop();
+
+    transcriptEl.textContent = text;
+    setState('thinking');
+
+    // Check voice commands
+    const lower = text.toLowerCase();
+    if (lower.includes('jarvis mute') || lower === 'mute') {
+        setState('standby');
+        statusEl.textContent = 'MUTED';
+        isProcessing = false;
+        return;
+    }
+
+    try {
+        // Get response
+        const chatRes = await fetch('/api/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({text})
+        });
+        const chatData = await chatRes.json();
+        const response = chatData.response || 'No response.';
+
+        responseEl.textContent = response.substring(0, 400);
+        setState('speaking');
+
+        // Get TTS audio
+        const ttsRes = await fetch('/api/tts', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({text: response.substring(0, 500)})
+        });
+        const audioBlob = await ttsRes.blob();
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+        audio.play();
+
+        await new Promise(resolve => {
+            audio.onended = resolve;
+            audio.onerror = resolve;
+        });
+
+    } catch(e) {
+        responseEl.textContent = 'Connection error.';
+        console.error(e);
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+    setState('listening');
+    isProcessing = false;
+    transcriptEl.textContent = '';
+    setTimeout(() => { responseEl.textContent = ''; }, 5000);
+    recognition.start();
+}
+
+// Init mic for waveform visualization
+async function initMic() {
+    try {
+        micStream = await navigator.mediaDevices.getUserMedia({audio: true});
+        audioContext = new AudioContext();
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        const source = audioContext.createMediaStreamSource(micStream);
+        source.connect(analyser);
+        animateWaves();
+    } catch(e) {
+        console.error('Mic error:', e);
+    }
+}
+
+initMic();
+startListening();
+</script>
+</body>
+</html>"""
