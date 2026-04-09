@@ -54,25 +54,11 @@ class Intelligence:
         if memory_context:
             prompt = f"(Context: {memory_context[:1500]})\n{message}"
 
-        msg_lower = message.lower()
-        action_words = ["open", "launch", "go to", "click", "play", "pause",
-                       "close", "check my", "show me", "navigate", "log in",
-                       "download", "send", "search for", "fill", "type",
-                       "press", "switch to", "create", "set up"]
-        is_action = any(msg_lower.startswith(w) or f" {w} " in f" {msg_lower} " for w in action_words)
-
-        # Cowork path
+        # Everything goes to Cowork side panel — no action detection needed
         if self._cowork and self._cowork._ready:
-            if is_action:
-                full_prompt = f"{self._system_context()}\n\nTask: {prompt}"
-                return await self._cowork.execute_task(full_prompt)
-            else:
-                full_prompt = f"{self._system_context()}\n\n{prompt}"
-                sent = await self._cowork.send_to_sidepanel(full_prompt)
-                if sent:
-                    response = await self._cowork.read_sidepanel_response(timeout=30)
-                    if response:
-                        return self._clean(response)
+            response = await self._cowork.send_and_read(prompt, timeout=45)
+            if response:
+                return self._clean(response)
 
         # Browser fallback
         if self._browser:
