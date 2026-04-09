@@ -108,7 +108,7 @@ class Orchestrator:
             return instant
 
         # ── PATH 2: Claude handles everything else ──
-        memory_context = self._get_relevant_context(message) if len(message.split()) > 3 else ""
+        memory_context = self._get_relevant_context(message) if len(message.split()) > 1 else ""
         try:
             response = await self.intelligence.think(message=message, memory_context=memory_context)
             self.spine.store(content=f"JARVIS: {response}", type="interaction",

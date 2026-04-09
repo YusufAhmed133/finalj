@@ -52,7 +52,7 @@ class Intelligence:
 
         prompt = message
         if memory_context:
-            prompt = f"(Context: {memory_context[:300]})\n{message}"
+            prompt = f"(Context: {memory_context[:1500]})\n{message}"
 
         msg_lower = message.lower()
         action_words = ["open", "launch", "go to", "click", "play", "pause",

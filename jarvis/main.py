@@ -41,17 +41,18 @@ class JARVIS:
         self._shutdown_event = None
 
     async def start(self, cli_mode: bool = False):
-        self._shutdown_event = asyncio.Event()
         """Start JARVIS."""
+        self._shutdown_event = asyncio.Event()
         log.info("=" * 50)
         log.info("JARVIS v3.0 starting...")
         log.info("=" * 50)
 
-        # 1. Initialize orchestrator (memory, intelligence, scheduler)
+        # 1. Initialize orchestrator (memory, intelligence)
         await self.orchestrator.initialize()
 
-        # 2. Mac control via instant commands + Claude DO: commands
-        log.info("Mac control: instant commands + Claude")
+        # 2. Schedule memory compaction (was never connected — FIXED)
+        asyncio.create_task(self._compaction_loop())
+        log.info("Memory compaction scheduled")
 
         # 3. Initialize knowledge agent
         await self.knowledge.initialize()
@@ -106,6 +107,34 @@ class JARVIS:
             await server.serve()
         except Exception as e:
             log.error(f"Voice server error: {e}")
+
+    async def _compaction_loop(self):
+        """Run memory compaction daily at 3am. Was NEVER scheduled before — now fixed."""
+        from jarvis.memory.compactor import MemoryCompactor
+        compactor = MemoryCompactor(self.orchestrator.spine)
+
+        while not self._shutdown_event.is_set():
+            try:
+                from datetime import datetime
+                now = datetime.now()
+                if now.hour == 3:
+                    results = await compactor.run_full_compaction()
+                    log.info(f"Memory compaction: {results}")
+                    # Also clean up TTS temp files
+                    import glob, os
+                    for f in glob.glob("/tmp/jarvis_tts/j_*.mp3"):
+                        try:
+                            if os.path.getmtime(f) < (now.timestamp() - 3600):
+                                os.unlink(f)
+                        except Exception:
+                            pass
+            except Exception as e:
+                log.error(f"Compaction error: {e}")
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=3600)
+                break
+            except asyncio.TimeoutError:
+                continue
 
     async def _knowledge_loop(self):
         """Run knowledge scraping on interval."""
