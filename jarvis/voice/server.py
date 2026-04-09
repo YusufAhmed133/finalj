@@ -57,6 +57,26 @@ async def tts_endpoint(request: Request):
     return FileResponse(str(filename), media_type="audio/mpeg")
 
 
+@app.get("/api/ack")
+async def ack_endpoint():
+    """Return a random pre-cached acknowledgment audio instantly."""
+    import random
+    ack_dir = Path("/tmp/jarvis_tts/ack")
+    files = list(ack_dir.glob("ack[1-5].mp3"))  # ack6 is the longer one for 6s+ waits
+    if files:
+        return FileResponse(str(random.choice(files)), media_type="audio/mpeg")
+    return JSONResponse({"error": "no ack files"}, 404)
+
+
+@app.get("/api/ack/long")
+async def ack_long_endpoint():
+    """Return the longer acknowledgment for 6s+ waits."""
+    path = Path("/tmp/jarvis_tts/ack/ack6.mp3")
+    if path.exists():
+        return FileResponse(str(path), media_type="audio/mpeg")
+    return JSONResponse({"error": "no ack file"}, 404)
+
+
 @app.post("/api/chat")
 async def chat_endpoint(request: Request):
     body = await request.json()
@@ -438,30 +458,45 @@ async function processCommand(text) {
     }
 
     try {
-        // Show acknowledgment immediately
         responseEl.textContent = '...';
 
-        // Get response
-        const chatRes = await fetch('/api/chat', {
+        // Play acknowledgment audio IMMEDIATELY while Claude thinks
+        const ackPromise = fetch('/api/ack').then(r => r.blob()).then(b => {
+            const ackAudio = new Audio(URL.createObjectURL(b));
+            ackAudio.play();
+        }).catch(() => {});
+
+        // Fetch response from Claude IN PARALLEL with ack audio
+        const chatPromise = fetch('/api/chat', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({text})
-        });
-        const chatData = await chatRes.json();
+        }).then(r => r.json());
+
+        // If chat takes > 6s, play longer ack
+        const longAckTimer = setTimeout(async () => {
+            try {
+                const r = await fetch('/api/ack/long');
+                const b = await r.blob();
+                new Audio(URL.createObjectURL(b)).play();
+            } catch(e) {}
+        }, 6000);
+
+        const chatData = await chatPromise;
+        clearTimeout(longAckTimer);
         const response = chatData.response || 'No response.';
 
         responseEl.textContent = response.substring(0, 400);
         setState('speaking');
 
-        // Get TTS audio
+        // Generate and play TTS for the actual response
         const ttsRes = await fetch('/api/tts', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({text: response.substring(0, 500)})
         });
         const audioBlob = await ttsRes.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const audio = new Audio(audioUrl);
+        const audio = new Audio(URL.createObjectURL(audioBlob));
         audio.play();
 
         await new Promise(resolve => {
