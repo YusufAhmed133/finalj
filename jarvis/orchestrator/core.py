@@ -20,7 +20,6 @@ from jarvis.brain.intelligence import Intelligence
 from jarvis.orchestrator.priority import score_priority, is_stop_command, is_cardiac_alert
 from jarvis.orchestrator.briefing import BriefingGenerator
 from jarvis.memory.patterns import PatternLearner
-from jarvis.agents.instant_mac import try_instant_command
 from jarvis.utils.logger import get_logger
 
 log = get_logger("orchestrator.core")
@@ -100,14 +99,14 @@ class Orchestrator:
         if message.startswith("/"):
             return await self._handle_command(message)
 
-        # ── PATH 1: Instant command (sub-second, no LLM) ──
-        instant = try_instant_command(message)
-        if instant:
-            self.spine.store(content=f"JARVIS: {instant}", type="interaction",
+        # ── PATH 1: Only volume/time/date handled instantly (everything else → Cowork) ──
+        quick = self._try_quick(message)
+        if quick:
+            self.spine.store(content=f"JARVIS: {quick}", type="interaction",
                            source="jarvis", metadata={"in_reply_to": mem_id, "instant": True})
-            return instant
+            return quick
 
-        # ── PATH 2: Claude handles everything else ──
+        # ── PATH 2: EVERYTHING else → Claude/Cowork (full computer use) ──
         memory_context = self._get_relevant_context(message) if len(message.split()) > 1 else ""
         try:
             response = await self.intelligence.think(message=message, memory_context=memory_context)
@@ -119,6 +118,32 @@ class Orchestrator:
             return f"Apologies sir, something went wrong: {str(e)[:150]}"
 
     # ── Internal ──
+
+    def _try_quick(self, message: str):
+        """ONLY volume and time. Everything else goes to Cowork."""
+        import subprocess
+        from datetime import datetime
+        msg = message.lower().strip()
+        for p in ["jarvis ", "hey ", "yo "]:
+            if msg.startswith(p): msg = msg[len(p):]
+
+        if msg in ("volume up", "louder"):
+            subprocess.run(["osascript", "-e", "set volume output volume ((output volume of (get volume settings)) + 15)"], capture_output=True, timeout=5)
+            return "Volume up."
+        if msg in ("volume down", "quieter"):
+            subprocess.run(["osascript", "-e", "set volume output volume ((output volume of (get volume settings)) - 15)"], capture_output=True, timeout=5)
+            return "Volume down."
+        if msg in ("mute",):
+            subprocess.run(["osascript", "-e", "set volume output muted true"], capture_output=True, timeout=5)
+            return "Muted."
+        if msg in ("unmute",):
+            subprocess.run(["osascript", "-e", "set volume output muted false"], capture_output=True, timeout=5)
+            return "Unmuted."
+        if any(x in msg for x in ["what time", "whats the time"]):
+            return datetime.now().strftime("It's %I:%M %p, sir.")
+        if any(x in msg for x in ["what date", "whats the date", "what day"]):
+            return datetime.now().strftime("%A, %d %B %Y.")
+        return None
 
     async def _handle_stop(self) -> str:
         log.warning("STOP command received — halting all actions")
