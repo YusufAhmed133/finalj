@@ -1,8 +1,10 @@
 """
 Instant Mac Control — Sub-second. No LLM.
 
-Strips filler ("yo", "can you", "please") then pattern matches.
-Falls through to Claude only if no pattern matches.
+1. Strip filler ("yo", "can you", "please", "so it is in front of me")
+2. Extract clean app name / command
+3. Execute via osascript (activate = bring to front)
+4. Verify it worked
 """
 import re
 import subprocess
@@ -12,40 +14,53 @@ from jarvis.utils.logger import get_logger
 
 log = get_logger("agents.instant_mac")
 
-FILLER = [
-    r"^(?:yo|hey|hi|ok|okay|oi|ey|so|um|uh)\s+",
+# ── Filler stripping ──
+FILLER_PRE = [
+    r"^(?:yo|hey|hi|ok|okay|oi|ey|so|um|uh|right)\s+",
     r"^(?:jarvis|j\.a\.r\.v\.i\.s)\s*[,]?\s*",
     r"^(?:can you|could you|would you|will you|please|pls)\s+",
     r"^(?:i want you to|i need you to|go ahead and|i want to)\s+",
     r"^(?:can you please|could you please)\s+",
+]
+FILLER_POST = [
     r"\s+(?:please|pls|thanks|thank you|for me|now|right now)$",
+    r"\s+(?:so it is|so it's|and put it|and bring it|and have it).*$",
+    r"\s+(?:on my desktop|on my screen|in front of me|on the screen).*$",
+    r"\s+(?:and make it|so i can see it|so i can use it).*$",
 ]
 
 
 def _strip(msg):
     msg = msg.lower().strip()
+    # Pre-filler
     changed = True
     while changed:
         changed = False
-        for p in FILLER:
+        for p in FILLER_PRE:
             new = re.sub(p, "", msg).strip()
-            if new != msg:
-                msg = new
-                changed = True
+            if new != msg: msg = new; changed = True
+    # Post-filler
+    for p in FILLER_POST:
+        msg = re.sub(p, "", msg).strip()
     return msg
 
 
 def _run(cmd, timeout=5):
+    """Run command, return (stdout+stderr, success)."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout.strip() or "Done"
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        output = (r.stdout.strip() + " " + r.stderr.strip()).strip()
+        return output, r.returncode == 0
     except Exception as e:
-        return str(e)
+        return str(e), False
 
 
 def _osa(script):
-    return _run(["osascript", "-e", script])
+    out, ok = _run(["osascript", "-e", script])
+    return out
 
 
+# ── App name mapping ──
 APP_MAP = {
     "spotify": "Spotify", "chrome": "Google Chrome", "google chrome": "Google Chrome",
     "safari": "Safari", "finder": "Finder", "terminal": "Terminal",
@@ -57,6 +72,8 @@ APP_MAP = {
     "zoom": "Zoom", "notion": "Notion", "whatsapp": "WhatsApp",
     "telegram": "Telegram", "preview": "Preview", "calculator": "Calculator",
     "cursor": "Cursor", "word": "Microsoft Word", "excel": "Microsoft Excel",
+    "arc": "Arc", "brave": "Brave Browser", "firefox": "Firefox",
+    "iterm": "iTerm", "warp": "Warp",
 }
 
 WEB_FALLBACK = {
@@ -66,34 +83,84 @@ WEB_FALLBACK = {
     "reddit": "https://reddit.com", "chatgpt": "https://chat.openai.com",
     "claude": "https://claude.ai", "instagram": "https://instagram.com",
     "facebook": "https://facebook.com", "linkedin": "https://linkedin.com",
-    "whatsapp": "https://web.whatsapp.com", "telegram": "https://web.telegram.org",
+    "whatsapp web": "https://web.whatsapp.com",
 }
 
 
+def _open_app(app_key):
+    """Open app and bring to foreground. Returns (message, success)."""
+    app_name = APP_MAP.get(app_key, app_key.title())
+
+    # Use AppleScript to open AND activate (bring to front)
+    script = f'''
+    tell application "{app_name}"
+        activate
+    end tell
+    '''
+    out, ok = _run(["osascript", "-e", script])
+
+    if ok:
+        log.info(f"Opened and activated: {app_name}")
+        return f"{app_name} is open, sir.", True
+
+    # App not found — try `open -a` as fallback
+    out2, ok2 = _run(["open", "-a", app_name])
+    if ok2:
+        log.info(f"Opened via open -a: {app_name}")
+        return f"{app_name} is open, sir.", True
+
+    # Try web fallback
+    web = WEB_FALLBACK.get(app_key)
+    if web:
+        _run(["open", web])
+        log.info(f"Web fallback: {web}")
+        return f"Opening {app_name} in browser, sir.", True
+
+    return f"Can't find {app_name} on this Mac, sir.", False
+
+
+def _extract_app_name(text):
+    """Extract just the app name from natural language.
+    'spotify so it is in front of me on my desktop' → 'spotify'
+    """
+    # Known app names — check longest first
+    text_lower = text.lower().strip()
+    for key in sorted(APP_MAP.keys(), key=len, reverse=True):
+        if text_lower.startswith(key):
+            return key
+    for key in sorted(WEB_FALLBACK.keys(), key=len, reverse=True):
+        if text_lower.startswith(key):
+            return key
+    # Strip articles
+    text_lower = re.sub(r"^(?:the|a|an|my)\s+", "", text_lower)
+    # Take first word(s) before common stop words
+    stop = ["so", "and", "on", "in", "for", "to", "that", "which", "then"]
+    words = text_lower.split()
+    name_words = []
+    for w in words:
+        if w in stop:
+            break
+        name_words.append(w)
+    return " ".join(name_words) if name_words else text_lower
+
+
 def try_instant_command(message):
+    """Match message to instant Mac command. Returns response or None."""
     msg = _strip(message)
 
     # ── Open App ──
-    m = re.match(r"(?:open|launch|start|run|fire up|bring up|pull up)\s+(.+?)(?:\s+app)?$", msg)
+    m = re.match(r"(?:open|launch|start|run|fire up|bring up|pull up)\s+(.+)", msg)
     if m:
-        app = re.sub(r"\s+(?:for me|please|now|up)$", "", m.group(1)).strip()
-        app_name = APP_MAP.get(app, app.title())
-        result = _run(["open", "-a", app_name])
-        if "unable" in result.lower() or "can't" in result.lower() or "error" in result.lower():
-            web = WEB_FALLBACK.get(app)
-            if web:
-                _run(["open", web])
-                log.info(f"Web fallback: {web}")
-                return f"Opening {app_name} in browser, sir."
-            return f"Can't find {app_name}, sir."
-        log.info(f"Opened: {app_name}")
-        return f"{app_name} is open, sir."
+        raw_app = m.group(1).strip()
+        app_key = _extract_app_name(raw_app)
+        reply, ok = _open_app(app_key)
+        return reply
 
     # ── URL ──
     m = re.match(r"(?:go to|open|navigate to|visit)\s+(https?://\S+)", msg)
     if m:
         _run(["open", m.group(1)]); return f"Opening {m.group(1)}."
-    m = re.match(r"(?:go to|open|navigate to|visit)\s+(\S+\.\S+)", msg)
+    m = re.match(r"(?:go to|navigate to|visit)\s+(\S+\.\S+)", msg)
     if m:
         url = m.group(1) if m.group(1).startswith("http") else "https://" + m.group(1)
         _run(["open", url]); return f"Opening {url}."
@@ -134,7 +201,9 @@ def try_instant_command(message):
     # ── Close ──
     m = re.match(r"(?:close|quit|exit|kill)\s+(.+)", msg)
     if m:
-        _osa(f'tell application "{m.group(1).strip().title()}" to quit'); return f"Closed {m.group(1).title()}."
+        app_key = _extract_app_name(m.group(1))
+        app_name = APP_MAP.get(app_key, app_key.title())
+        _osa(f'tell application "{app_name}" to quit'); return f"Closed {app_name}."
 
     # ── Screenshot ──
     if "screenshot" in msg:
@@ -157,12 +226,9 @@ def try_instant_command(message):
         _run(["pmset", "displaysleepnow"]); return "Locking."
 
     # ── Folders ──
-    if "downloads" in msg and ("open" in msg or "go to" in msg):
-        _run(["open", str(Path.home() / "Downloads")]); return "Downloads open."
-    if "desktop" in msg and ("open" in msg or "go to" in msg):
-        _run(["open", str(Path.home() / "Desktop")]); return "Desktop open."
-    if "documents" in msg and ("open" in msg or "go to" in msg):
-        _run(["open", str(Path.home() / "Documents")]); return "Documents open."
+    for folder in ["downloads", "desktop", "documents"]:
+        if folder in msg and any(x in msg for x in ["open", "go to", "show"]):
+            _run(["open", str(Path.home() / folder.title())]); return f"{folder.title()} open."
 
     return None
 
@@ -174,6 +240,6 @@ def is_instant_command(message):
         r"(?:go to|navigate to|visit)\s+", r"(?:search for|search|google|look up)\s+",
         r"(?:close|quit|exit|kill)\s+", r"(?:play|pause|next|skip|previous|stop|resume)",
         r"(?:volume|mute|unmute|louder|quieter)", r"screenshot",
-        r"(?:what time|whats the time|what date|whats the date)",
+        r"(?:what time|whats the time|what date|whats the date|what day)",
         r"(?:dark mode|light mode|lock)",
     ])
