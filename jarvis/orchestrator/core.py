@@ -11,7 +11,9 @@ The orchestrator is the central coordinator:
 - Manages JARVIS modes (active, focus, sleep)
 """
 import asyncio
+import hashlib
 import json
+import subprocess
 import time
 from datetime import datetime
 from typing import Optional
@@ -54,6 +56,8 @@ class Orchestrator:
         self.running = False
         self._action_in_progress = False
         self._stop_event = asyncio.Event()
+        self._cache = {}  # {hash: (response, timestamp)}
+        self._cache_ttl = 300  # 5 minutes
 
         self.send_message_callback = None
         self.send_approval_callback = None
@@ -122,7 +126,14 @@ class Orchestrator:
                            source="jarvis", metadata={"in_reply_to": mem_id, "instant": True})
             return instant
 
-        # Step 2: Check if this is an action → route to Cowork
+        # Step 2: Check cache
+        cache_key = hashlib.md5(message.lower().strip().encode()).hexdigest()
+        cached = self._cache.get(cache_key)
+        if cached and time.time() - cached[1] < self._cache_ttl:
+            log.info("Cache hit")
+            return cached[0]
+
+        # Step 3: Check if this is an action → route to Cowork
         msg_lower = message.lower()
         action_signals = ["open", "launch", "go to", "click", "type", "send",
                          "play", "close", "move", "resize", "fill", "submit",
@@ -132,71 +143,51 @@ class Orchestrator:
         is_action = any(msg_lower.startswith(s) or f" {s} " in f" {msg_lower} " for s in action_signals)
 
         if is_action:
-            # Route to Claude with Cowork trigger
             try:
                 response = await self.intelligence.think(
                     f"Use your computer to do this: {message}"
                 )
-                self.spine.store(content=f"JARVIS (action): {response}", type="interaction",
+                reply = self._exec_do_commands(response)
+                self.spine.store(content=f"JARVIS: {reply}", type="interaction",
                                source="jarvis", metadata={"in_reply_to": mem_id, "action": True})
-
-                # Also execute any DO: commands Claude returns
-                import subprocess
-                clean_lines = []
-                for line in response.split("\n"):
-                    if line.strip().startswith("DO:"):
-                        cmd = line.strip()[3:].strip()
-                        log.info(f"Executing: {cmd}")
-                        try:
-                            if cmd.startswith("tell ") or cmd.startswith("do "):
-                                subprocess.run(["osascript", "-e", cmd], timeout=10, capture_output=True)
-                            else:
-                                subprocess.run(cmd, shell=True, timeout=10, capture_output=True)
-                        except Exception:
-                            pass
-                    else:
-                        clean_lines.append(line)
-                return "\n".join(clean_lines).strip() or response
-
+                return reply
             except Exception as e:
                 log.error(f"Action error: {e}")
                 return f"Couldn't do that, sir: {str(e)[:100]}"
 
-        # Step 3: Regular conversation — only search memory for substantive messages
+        # Step 4: Regular conversation
         memory_context = ""
         if len(message.split()) > 3:
             memory_context = self._get_relevant_context(message)
         try:
-            response = await self.intelligence.think(
-                message=message,
-                memory_context=memory_context,
-            )
-
-            # Check if Claude returned DO: commands
-            import subprocess
-            clean_lines = []
-            for line in response.split("\n"):
-                if line.strip().startswith("DO:"):
-                    cmd = line.strip()[3:].strip()
-                    log.info(f"Executing: {cmd}")
-                    try:
-                        if cmd.startswith("tell ") or cmd.startswith("do "):
-                            subprocess.run(["osascript", "-e", cmd], timeout=10, capture_output=True)
-                        else:
-                            subprocess.run(cmd, shell=True, timeout=10, capture_output=True)
-                    except Exception as e:
-                        log.error(f"Mac control error: {e}")
-                else:
-                    clean_lines.append(line)
-
-            reply = "\n".join(clean_lines).strip()
+            response = await self.intelligence.think(message=message, memory_context=memory_context)
+            reply = self._exec_do_commands(response)
             self.spine.store(content=f"JARVIS: {reply}", type="interaction",
                            source="jarvis", metadata={"in_reply_to": mem_id})
+            # Cache non-action responses
+            self._cache[cache_key] = (reply, time.time())
             return reply
-
         except Exception as e:
             log.error(f"Intelligence error: {e}")
             return f"Apologies sir, something went wrong: {str(e)[:150]}"
+
+    def _exec_do_commands(self, response: str) -> str:
+        """Execute DO: lines from Claude and return cleaned response."""
+        clean_lines = []
+        for line in response.split("\n"):
+            if line.strip().startswith("DO:"):
+                cmd = line.strip()[3:].strip()
+                log.info(f"Executing: {cmd}")
+                try:
+                    if cmd.startswith("tell ") or cmd.startswith("do "):
+                        subprocess.run(["osascript", "-e", cmd], timeout=10, capture_output=True)
+                    else:
+                        subprocess.run(cmd, shell=True, timeout=10, capture_output=True)
+                except Exception as e:
+                    log.error(f"Exec error: {e}")
+            else:
+                clean_lines.append(line)
+        return "\n".join(clean_lines).strip() or response
 
     async def _handle_stop(self) -> str:
         """Handle STOP/KILL command — halt everything immediately."""

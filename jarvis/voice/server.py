@@ -401,7 +401,7 @@ function startListening() {
                 if (finalTranscript.trim().length > 1 && !isProcessing) {
                     processCommand(finalTranscript.trim());
                 }
-            }, 800);
+            }, 500);
         }
     };
 
@@ -438,6 +438,9 @@ async function processCommand(text) {
     }
 
     try {
+        // Show acknowledgment immediately
+        responseEl.textContent = '...';
+
         // Get response
         const chatRes = await fetch('/api/chat', {
             method: 'POST',
@@ -471,7 +474,6 @@ async function processCommand(text) {
         console.error(e);
     }
 
-    await new Promise(r => setTimeout(r, 500));
     isProcessing = false;
     transcriptEl.textContent = '';
     setTimeout(() => { responseEl.textContent = ''; }, 5000);

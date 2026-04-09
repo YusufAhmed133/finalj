@@ -104,7 +104,10 @@ class ClaudeBrowser:
             if not self._page:
                 self._page = await ctx.new_page()
                 await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(3)
+                try:
+                    await self._page.wait_for_selector(INPUT_SELECTORS[0], timeout=8000)
+                except Exception:
+                    await asyncio.sleep(1)
                 log.info("Opened new claude.ai tab")
 
             # Check if logged in
@@ -205,7 +208,10 @@ class ClaudeBrowser:
         session_name = f"JARVIS Session {date_str}"
 
         await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
-        await asyncio.sleep(1)
+        try:
+            await self._page.wait_for_selector(INPUT_SELECTORS[0], timeout=5000)
+        except Exception:
+            await asyncio.sleep(0.5)
         self._session_started = True
         self._turn_count = 0
         log.info(f"Session started: {session_name}")
@@ -263,28 +269,40 @@ class ClaudeBrowser:
         return response
 
     async def _wait_for_response(self, timeout: int) -> str:
-        """Wait for response: fast poll with early exit."""
+        """Fast response detection: STREAMING_JS + adaptive polling."""
         start = time.time()
+
+        # Wait for response to start (fast 200ms polls)
+        for _ in range(40):  # 8s max wait for first token
+            text = await self._page.evaluate(RESPONSE_JS)
+            if text and text.strip():
+                break
+            await asyncio.sleep(0.2)
+
+        # Now wait for streaming to finish
         last_text = ""
         stable = 0
-
-        # Initial wait for response to start appearing
-        await asyncio.sleep(1.5)
-
         while time.time() - start < timeout:
+            is_streaming = await self._page.evaluate(STREAMING_JS)
             text = await self._page.evaluate(RESPONSE_JS)
             text = text.strip() if text else ""
 
+            # Primary: streaming indicator says done + we have text
+            if not is_streaming and text:
+                return text
+
+            # Fallback: text stability check
             if text and text != last_text:
                 last_text = text
                 stable = 0
             elif text:
                 stable += 1
-                # 2 stable reads = done (each 0.5s apart = 1s of no change)
-                if stable >= 2:
+                if stable >= 3:
                     return last_text
 
-            await asyncio.sleep(0.5)
+            # Adaptive: fast at start, slower after 5s
+            elapsed = time.time() - start
+            await asyncio.sleep(0.2 if elapsed < 5 else 0.4)
 
         return last_text or ""
 
