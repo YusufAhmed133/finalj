@@ -50,8 +50,8 @@ class JARVIS:
         # 1. Initialize orchestrator (memory, intelligence, scheduler)
         await self.orchestrator.initialize()
 
-        # 2. Computer use — handled by instant_mac + Gemini vision
-        log.info("Mac control: instant commands + Gemini vision")
+        # 2. Mac control via instant commands + Claude DO: commands
+        log.info("Mac control: instant commands + Claude")
 
         # 3. Initialize knowledge agent
         await self.knowledge.initialize()
