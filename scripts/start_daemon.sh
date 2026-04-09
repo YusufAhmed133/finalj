@@ -12,7 +12,7 @@ cd "$PROJECT_DIR"
 if ! curl -s http://localhost:9222/json/version >/dev/null 2>&1; then
     echo "Starting Chrome with CDP..."
     mkdir -p "$CHROME_PROFILE"
-    "$CHROME" --remote-debugging-port=9222 --user-data-dir="$CHROME_PROFILE" --no-first-run --no-default-browser-check &
+    "$CHROME" --remote-debugging-port=9222 '--remote-allow-origins=*' --user-data-dir="$CHROME_PROFILE" --no-first-run --no-default-browser-check &
     sleep 5
 fi
 

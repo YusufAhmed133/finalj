@@ -99,14 +99,15 @@ class Orchestrator:
         if message.startswith("/"):
             return await self._handle_command(message)
 
-        # ── PATH 1: Only volume/time/date handled instantly (everything else → Cowork) ──
-        quick = self._try_quick(message)
-        if quick:
-            self.spine.store(content=f"JARVIS: {quick}", type="interaction",
-                           source="jarvis", metadata={"in_reply_to": mem_id, "instant": True})
-            return quick
+        # ── PATH 1: Try direct Mac execution (URLs, apps, music, browser control) ──
+        from jarvis.agents.mac_execute import execute as mac_execute
+        mac_result = await mac_execute(message)
+        if mac_result:
+            self.spine.store(content=f"JARVIS: {mac_result}", type="interaction",
+                           source="jarvis", metadata={"in_reply_to": mem_id, "action": True})
+            return mac_result
 
-        # ── PATH 2: EVERYTHING else → Claude/Cowork (full computer use) ──
+        # ── PATH 2: Questions → Claude ──
         memory_context = self._get_relevant_context(message) if len(message.split()) > 1 else ""
         try:
             response = await self.intelligence.think(message=message, memory_context=memory_context)
