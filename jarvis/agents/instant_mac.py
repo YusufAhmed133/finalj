@@ -161,7 +161,9 @@ def _open_app(app_key):
         log.info(f"Web fallback: {web}")
         return f"Opening {app_name} in browser, sir.", True
 
-    return f"Can't find {app_name} on this Mac, sir.", False
+    # Can't handle locally — return None to fall through to Claude/Cowork
+    log.info(f"Can't find '{app_key}' locally, passing to Claude")
+    return None, False
 
 
 def _extract_app_name(text):
@@ -199,7 +201,8 @@ def try_instant_command(message):
         raw_app = m.group(1).strip()
         app_key = _extract_app_name(raw_app)
         reply, ok = _open_app(app_key)
-        return reply
+        if reply:  # None means fall through to Claude/Cowork
+            return reply
 
     # ── URL ──
     m = re.match(r"(?:go to|open|navigate to|visit)\s+(https?://\S+)", msg)
