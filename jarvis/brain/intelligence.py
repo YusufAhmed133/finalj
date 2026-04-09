@@ -89,23 +89,25 @@ class Intelligence:
         return "Intelligence offline."
 
     def _clean(self, text: str) -> str:
-        """Strip Claude's thinking artifacts and meta-text."""
-        noise_patterns = [
-            "Thinking about", "thinking about", "Thought process",
-            "concerns with this request", "I need to be careful",
-            "Let me think about", "I should be", "I'll help",
-            "I want to be", "I need to consider",
+        """Aggressively strip Claude's thinking artifacts."""
+        import re
+        # Remove entire lines containing noise
+        noise = [
+            "thinking about", "thought process", "concerns with",
+            "i need to be careful", "let me think", "i should be",
+            "i want to be", "i need to consider", "i'll help",
+            "allowed", "user request", "this request",
         ]
         lines = []
         for line in text.split("\n"):
-            if any(n.lower() in line.lower() for n in noise_patterns):
+            if any(n in line.lower() for n in noise):
                 continue
             lines.append(line)
         result = "\n".join(lines).strip()
-        # If everything was filtered, return original minus first line of noise
         if not result and text.strip():
-            parts = text.strip().split("\n")
-            return parts[-1].strip() if len(parts) > 1 else text.strip()
+            # Everything was noise — take the last sentence
+            sentences = re.split(r'[.!?]\s+', text.strip())
+            return sentences[-1].strip() if sentences else text.strip()
         return result
 
     async def health_check(self) -> dict:
