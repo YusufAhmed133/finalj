@@ -87,9 +87,37 @@ WEB_FALLBACK = {
 }
 
 
+def _find_installed_app(name):
+    """Try to find an installed app by fuzzy matching against mdfind."""
+    try:
+        out, ok = _run(["mdfind", 'kMDItemKind == "Application"'], timeout=5)
+        if not ok:
+            return None
+        import os, difflib
+        apps = {}
+        for path in out.split('\n'):
+            app = os.path.basename(path).replace('.app', '')
+            apps[app.lower()] = app
+        # Exact match first
+        if name in apps:
+            return apps[name]
+        # Fuzzy match
+        matches = difflib.get_close_matches(name, apps.keys(), n=1, cutoff=0.85)
+        if matches:
+            return apps[matches[0]]
+    except Exception:
+        pass
+    return None
+
+
 def _open_app(app_key):
     """Open app and bring to foreground. Returns (message, success)."""
-    app_name = APP_MAP.get(app_key, app_key.title())
+    # Check known map first, then mdfind, then .title() fallback
+    app_name = APP_MAP.get(app_key)
+    if not app_name:
+        app_name = _find_installed_app(app_key)
+    if not app_name:
+        app_name = app_key.title()
 
     # Use AppleScript to open AND activate (bring to front)
     script = f'''
@@ -101,13 +129,15 @@ def _open_app(app_key):
 
     if ok:
         log.info(f"Opened and activated: {app_name}")
-        return f"{app_name} is open, sir.", True
+        return f"Done, sir. {app_name} is up.", True
 
-    # App not found — try `open -a` as fallback
+    # App not found by AppleScript — try `open -a` as fallback
     out2, ok2 = _run(["open", "-a", app_name])
     if ok2:
+        # Also activate to bring to front
+        _run(["osascript", "-e", f'tell application "{app_name}" to activate'])
         log.info(f"Opened via open -a: {app_name}")
-        return f"{app_name} is open, sir.", True
+        return f"Done, sir. {app_name} is up.", True
 
     # Try web fallback
     web = WEB_FALLBACK.get(app_key)
