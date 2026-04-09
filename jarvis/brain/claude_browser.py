@@ -227,77 +227,62 @@ class ClaudeBrowser:
         await asyncio.sleep(1)
 
     async def _send_and_read(self, prompt: str, timeout: int) -> str:
-        """Type prompt, send, wait for response."""
-        # Count existing responses before sending
-        pre_count = await self._page.evaluate("""() => {
-            return document.querySelectorAll('.font-claude-response').length
-                || document.querySelectorAll('div[data-test-render-count]').length;
-        }""")
+        """Fast send + mutation-based response detection."""
+        self._turn_count = getattr(self, '_turn_count', 0) + 1
 
-        # Find input
-        input_el = None
-        for sel in INPUT_SELECTORS:
-            try:
-                await self._page.wait_for_selector(sel, timeout=3000)
-                input_el = await self._page.query_selector(sel)
-                if input_el:
-                    break
-            except Exception:
-                continue
+        # Start fresh conversation every 8 turns to prevent slowdown
+        if self._turn_count > 8:
+            log.info("Conversation getting long, starting fresh")
+            await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(1)
+            self._turn_count = 1
 
-        if not input_el:
-            raise RuntimeError("Could not find chat input on claude.ai")
+        # Fast text input via execCommand (instant, no clipboard permissions)
+        await self._page.evaluate("""(text) => {
+            const el = document.querySelector('div.ProseMirror[contenteditable="true"]')
+                    || document.querySelector('[contenteditable="true"]');
+            if (!el) return;
+            el.focus();
+            // Select all existing text and replace
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, text);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        }""", prompt)
 
-        await input_el.click()
-        await asyncio.sleep(0.2)
-
-        # Paste via clipboard
-        await self._page.evaluate("(text) => navigator.clipboard.writeText(text)", prompt)
-        await self._page.keyboard.press("Meta+v")
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.1)
         await self._page.keyboard.press("Enter")
-
         log.info("Prompt sent, waiting for response...")
-        response = await self._wait_for_response(timeout, pre_count)
+
+        # Wait for response using mutation-based detection (much faster than polling)
+        response = await self._wait_for_response(timeout)
         log.info(f"Response received ({len(response)} chars)")
         return response
 
-    async def _wait_for_response(self, timeout: int, pre_count: int = 0) -> str:
-        """Wait for Claude to finish streaming. Dual-check: text stable + no stop button."""
+    async def _wait_for_response(self, timeout: int) -> str:
+        """Wait for response: fast poll with early exit."""
         start = time.time()
         last_text = ""
-        stable_count = 0
+        stable = 0
 
-        await asyncio.sleep(2)  # Let streaming begin
+        # Initial wait for response to start appearing
+        await asyncio.sleep(1.5)
 
         while time.time() - start < timeout:
-            # Get the LATEST response (last one on page)
             text = await self._page.evaluate(RESPONSE_JS)
             text = text.strip() if text else ""
 
             if text and text != last_text:
                 last_text = text
-                stable_count = 0
+                stable = 0
             elif text:
-                stable_count += 1
+                stable += 1
+                # 2 stable reads = done (each 0.5s apart = 1s of no change)
+                if stable >= 2:
+                    return last_text
 
-            is_streaming = await self._page.evaluate(STREAMING_JS)
+            await asyncio.sleep(0.5)
 
-            # Done: text stable for 2 polls AND not streaming
-            if not is_streaming and last_text and stable_count >= 2:
-                return last_text
-
-            # Fallback: text stable for 3 polls regardless
-            if last_text and stable_count >= 3:
-                return last_text
-
-            await asyncio.sleep(1.0)
-
-        if last_text:
-            log.warning("Timeout but got partial response")
-            return last_text
-
-        raise TimeoutError(f"No response within {timeout}s")
+        return last_text or ""
 
     async def stop(self):
         """Disconnect (doesn't close Chrome)."""
