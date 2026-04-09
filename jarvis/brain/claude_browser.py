@@ -169,20 +169,51 @@ class ClaudeBrowser:
         except Exception:
             return False
 
+    async def _reconnect(self):
+        """Reconnect to Chrome if connection dropped."""
+        log.warning("Reconnecting to Chrome...")
+        try:
+            if self._browser:
+                await self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright:
+                await self._playwright.stop()
+        except Exception:
+            pass
+        self._started = False
+        return await self.start()
+
     async def think(self, prompt: str, timeout: int = 120) -> str:
         """Send a prompt in a NEW conversation and return the response."""
-        if not self._started:
-            raise RuntimeError("Browser not started. Call start() first.")
-
-        await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
-        await asyncio.sleep(1)
-        return await self._send_and_read(prompt, timeout)
+        try:
+            if not self._started:
+                await self._reconnect()
+            await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(1)
+            return await self._send_and_read(prompt, timeout)
+        except Exception as e:
+            if "closed" in str(e).lower() or "target" in str(e).lower():
+                log.warning(f"Connection lost: {e}. Reconnecting...")
+                if await self._reconnect():
+                    await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
+                    await asyncio.sleep(1)
+                    return await self._send_and_read(prompt, timeout)
+            raise
 
     async def think_in_conversation(self, prompt: str, timeout: int = 120) -> str:
         """Send a prompt in the CURRENT conversation (no navigation)."""
-        if not self._started:
-            raise RuntimeError("Browser not started. Call start() first.")
-        return await self._send_and_read(prompt, timeout)
+        try:
+            if not self._started:
+                await self._reconnect()
+            return await self._send_and_read(prompt, timeout)
+        except Exception as e:
+            if "closed" in str(e).lower() or "target" in str(e).lower():
+                log.warning(f"Connection lost: {e}. Reconnecting...")
+                if await self._reconnect():
+                    return await self._send_and_read(prompt, timeout)
+            raise
 
     async def new_conversation(self):
         """Navigate to a fresh conversation."""
