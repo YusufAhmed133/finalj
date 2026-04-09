@@ -183,21 +183,32 @@ class ClaudeBrowser:
         return await self.start()
 
     async def think(self, prompt: str, timeout: int = 120) -> str:
-        """Send a prompt in a NEW conversation and return the response."""
+        """Send a prompt. Creates a new session conversation ONCE, then reuses it."""
         try:
             if not self._started:
                 await self._reconnect()
-            await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(1)
+            if not getattr(self, '_session_started', False):
+                await self._start_session()
             return await self._send_and_read(prompt, timeout)
         except Exception as e:
             if "closed" in str(e).lower() or "target" in str(e).lower():
                 log.warning(f"Connection lost: {e}. Reconnecting...")
                 if await self._reconnect():
-                    await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
-                    await asyncio.sleep(1)
+                    await self._start_session()
                     return await self._send_and_read(prompt, timeout)
             raise
+
+    async def _start_session(self):
+        """Create ONE session conversation named with today's date."""
+        from datetime import datetime
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        session_name = f"JARVIS Session {date_str}"
+
+        await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(1)
+        self._session_started = True
+        self._turn_count = 0
+        log.info(f"Session started: {session_name}")
 
     async def think_in_conversation(self, prompt: str, timeout: int = 120) -> str:
         """Send a prompt in the CURRENT conversation (no navigation)."""
@@ -218,14 +229,16 @@ class ClaudeBrowser:
         await asyncio.sleep(1)
 
     async def _send_and_read(self, prompt: str, timeout: int) -> str:
-        """Fast send + mutation-based response detection."""
+        """Fast send in current conversation."""
         self._turn_count = getattr(self, '_turn_count', 0) + 1
 
-        # Start fresh conversation every 8 turns to prevent slowdown
-        if self._turn_count > 8:
-            log.info("Conversation getting long, starting fresh")
-            await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(1)
+        # After 30 turns, start a new session to prevent context slowdown
+        if self._turn_count > 30:
+            log.info("Session getting long, starting fresh session")
+            await self._start_session()
+            # Re-send personality
+            from jarvis.brain.intelligence import Intelligence
+            # Just reset counter, personality will be sent by intelligence layer
             self._turn_count = 1
 
         # Fast text input via execCommand (instant, no clipboard permissions)
