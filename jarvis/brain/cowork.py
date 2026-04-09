@@ -53,56 +53,67 @@ class CoworkBridge:
         return False
 
     async def send_and_read(self, prompt: str, timeout: int = 60) -> str:
-        """Type prompt into side panel, click send, wait for and return response."""
+        """Type prompt into side panel via CDP keyboard events, click send, read response."""
         sp_url = _find_sidepanel()
         if not sp_url:
             return "Cowork side panel not found. Open the Claude extension in Chrome."
 
-        # Step 1: Type and send
         try:
             async with websockets.connect(sp_url) as ws:
-                # Escape the prompt for JS
-                safe_prompt = json.dumps(prompt)
+                # Step 1: Focus editor
+                await ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+                    "expression": "document.querySelector('.ProseMirror')?.focus(); 'ok'",
+                    "returnByValue": True
+                }}))
+                await asyncio.wait_for(ws.recv(), timeout=3)
+                await asyncio.sleep(0.2)
 
-                await ws.send(json.dumps({
-                    "id": 1,
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": f"""
-                        (() => {{
-                            const editor = document.querySelector('.ProseMirror')
-                                || document.querySelector('[contenteditable="true"]');
-                            if (!editor) return 'no editor';
-                            editor.focus();
-                            editor.innerHTML = '<p>' + {safe_prompt} + '</p>';
-                            editor.dispatchEvent(new Event('input', {{bubbles: true}}));
-                            setTimeout(() => {{
-                                const btn = document.querySelector('[aria-label="Send message"]')
-                                    || document.querySelector('button[type="submit"]')
-                                    || [...document.querySelectorAll('button')].find(b =>
-                                        b.querySelector('svg') && b.offsetParent !== null &&
-                                        b.closest('[class*="input"], [class*="composer"], fieldset'));
-                                if (btn) btn.click();
-                            }}, 300);
-                            return 'sent';
-                        }})()
-                        """,
-                        "returnByValue": True
-                    }
-                }))
-                result = await asyncio.wait_for(ws.recv(), timeout=5)
-                data = json.loads(result)
-                status = data.get("result", {}).get("result", {}).get("value", "")
-                log.info(f"Cowork send: {status}")
+                # Step 2: Clear any existing text (Cmd+A then Delete)
+                for key_info in [
+                    {"key": "a", "code": "KeyA", "modifiers": 4},  # Cmd+A
+                    {"key": "Backspace", "code": "Backspace"},      # Delete
+                ]:
+                    mods = key_info.pop("modifiers", 0)
+                    await ws.send(json.dumps({"id": 2, "method": "Input.dispatchKeyEvent",
+                        "params": {"type": "keyDown", "modifiers": mods, **key_info}}))
+                    await asyncio.wait_for(ws.recv(), timeout=2)
+                    await ws.send(json.dumps({"id": 2, "method": "Input.dispatchKeyEvent",
+                        "params": {"type": "keyUp", "modifiers": mods, **key_info}}))
+                    await asyncio.wait_for(ws.recv(), timeout=2)
 
-                if status == "no editor":
-                    return "Could not find input in Cowork side panel."
+                await asyncio.sleep(0.1)
+
+                # Step 3: Type prompt character by character via CDP keyboard events
+                for char in prompt:
+                    await ws.send(json.dumps({"id": 3, "method": "Input.dispatchKeyEvent",
+                        "params": {"type": "char", "text": char}}))
+                    await asyncio.wait_for(ws.recv(), timeout=2)
+
+                await asyncio.sleep(0.3)
+
+                # Step 4: Click send button
+                await ws.send(json.dumps({"id": 4, "method": "Runtime.evaluate", "params": {
+                    "expression": """
+                    (() => {
+                        const btn = document.querySelector('[aria-label="Send message"]');
+                        if (btn && !btn.disabled) { btn.click(); return 'sent'; }
+                        return 'send_disabled';
+                    })()
+                    """,
+                    "returnByValue": True
+                }}))
+                result = await asyncio.wait_for(ws.recv(), timeout=3)
+                status = json.loads(result).get("result", {}).get("result", {}).get("value", "")
+                log.info(f"Cowork: {status}")
+
+                if status != "sent":
+                    return "Could not send to Cowork — send button disabled."
 
         except Exception as e:
             log.error(f"Cowork send error: {e}")
             return f"Cowork error: {str(e)[:100]}"
 
-        # Step 2: Wait for response
+        # Step 5: Wait for response
         return await self._read_response(timeout)
 
     async def _read_response(self, timeout: int = 60) -> str:
@@ -126,19 +137,22 @@ class CoworkBridge:
                         "params": {
                             "expression": """
                             (() => {
-                                // Get last response from side panel
-                                const msgs = document.querySelectorAll('.font-claude-response');
-                                if (msgs.length > 0) {
-                                    let text = msgs[msgs.length - 1].innerText;
-                                    // Strip thinking artifacts
-                                    text = text.replace(/Thought for \\d+s?/gi, '');
-                                    text = text.replace(/Thinking about[^\\n]*/gi, '');
-                                    text = text.replace(/Connector search[^\\n]*/gi, '');
-                                    return text.trim();
+                                // Side panel response — get full body text and extract last response
+                                const body = document.body.innerText;
+                                // Split by known markers
+                                const parts = body.split(/Ask before acting|Optimistic|How can I help/);
+                                // Get the last substantial chunk (Claude's response)
+                                for (let i = parts.length - 1; i >= 0; i--) {
+                                    const chunk = parts[i].trim();
+                                    if (chunk.length > 5 && !chunk.includes('Sonnet') && !chunk.includes('quick mode')) {
+                                        // Clean thinking artifacts
+                                        let clean = chunk.replace(/Thought for \\d+s?/gi, '');
+                                        clean = clean.replace(/Thinking about[^\\n]*/gi, '');
+                                        clean = clean.replace(/Connector search[^\\n]*/gi, '');
+                                        clean = clean.replace(/\\d+ connectors?[^\\n]*/gi, '');
+                                        return clean.trim();
+                                    }
                                 }
-                                // Fallback
-                                const all = document.querySelectorAll('[data-message-author-role="assistant"]');
-                                if (all.length > 0) return all[all.length - 1].innerText.trim();
                                 return '';
                             })()
                             """,
