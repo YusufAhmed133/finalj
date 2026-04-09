@@ -122,8 +122,47 @@ class Orchestrator:
                            source="jarvis", metadata={"in_reply_to": mem_id, "instant": True})
             return instant
 
-        # Step 2: Route to intelligence for everything else
-        # Only search memory for substantive messages (not greetings/short)
+        # Step 2: Check if this is an action → route to Cowork
+        msg_lower = message.lower()
+        action_signals = ["open", "launch", "go to", "click", "type", "send",
+                         "play", "close", "move", "resize", "fill", "submit",
+                         "download", "upload", "screenshot", "check my",
+                         "show me", "find", "navigate", "switch to",
+                         "set up", "log in", "sign in", "create"]
+        is_action = any(msg_lower.startswith(s) or f" {s} " in f" {msg_lower} " for s in action_signals)
+
+        if is_action:
+            # Route to Claude with Cowork trigger
+            try:
+                response = await self.intelligence.think(
+                    f"Use your computer to do this: {message}"
+                )
+                self.spine.store(content=f"JARVIS (action): {response}", type="interaction",
+                               source="jarvis", metadata={"in_reply_to": mem_id, "action": True})
+
+                # Also execute any DO: commands Claude returns
+                import subprocess
+                clean_lines = []
+                for line in response.split("\n"):
+                    if line.strip().startswith("DO:"):
+                        cmd = line.strip()[3:].strip()
+                        log.info(f"Executing: {cmd}")
+                        try:
+                            if cmd.startswith("tell ") or cmd.startswith("do "):
+                                subprocess.run(["osascript", "-e", cmd], timeout=10, capture_output=True)
+                            else:
+                                subprocess.run(cmd, shell=True, timeout=10, capture_output=True)
+                        except Exception:
+                            pass
+                    else:
+                        clean_lines.append(line)
+                return "\n".join(clean_lines).strip() or response
+
+            except Exception as e:
+                log.error(f"Action error: {e}")
+                return f"Couldn't do that, sir: {str(e)[:100]}"
+
+        # Step 3: Regular conversation — only search memory for substantive messages
         memory_context = ""
         if len(message.split()) > 3:
             memory_context = self._get_relevant_context(message)
