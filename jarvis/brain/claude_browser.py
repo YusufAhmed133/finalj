@@ -28,7 +28,10 @@ from jarvis.utils.logger import get_logger
 
 log = get_logger("brain.claude_browser")
 
-CLAUDE_URL = "https://claude.ai/new"
+# Use Claude Chrome extension side panel (Cowork) instead of claude.ai
+CLAUDE_EXT_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
+CLAUDE_URL = f"chrome-extension://{CLAUDE_EXT_ID}/sidepanel.html"
+CLAUDE_WEB_URL = "https://claude.ai/new"  # Fallback
 CDP_ENDPOINT = "http://localhost:9222"
 CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CHROME_PROFILE = Path.home() / "Library" / "Application Support" / "Google" / "Chrome-JARVIS"
@@ -93,22 +96,34 @@ class ClaudeBrowser:
             else:
                 ctx = await self._browser.new_context()
 
-            # Find or create claude.ai tab
+            # Find or create Claude extension (Cowork) tab
             self._page = None
             for page in ctx.pages:
-                if "claude.ai" in page.url:
+                if CLAUDE_EXT_ID in page.url or "sidepanel.html" in page.url:
                     self._page = page
-                    log.info(f"Found existing claude.ai tab: {page.url}")
+                    log.info(f"Found existing Cowork tab: {page.url}")
                     break
 
             if not self._page:
+                # Try opening Cowork extension panel
                 self._page = await ctx.new_page()
-                await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=30000)
                 try:
-                    await self._page.wait_for_selector(INPUT_SELECTORS[0], timeout=8000)
-                except Exception:
-                    await asyncio.sleep(1)
-                log.info("Opened new claude.ai tab")
+                    await self._page.goto(CLAUDE_URL, wait_until="domcontentloaded", timeout=15000)
+                    await asyncio.sleep(2)
+                    # Check if it loaded
+                    text = await self._page.evaluate("() => document.body?.innerText || ''")
+                    if "How can I help" in text or "Claude" in text:
+                        log.info("Cowork extension loaded")
+                    else:
+                        raise Exception("Extension page didn't load")
+                except Exception as e:
+                    log.warning(f"Cowork extension not available: {e}. Falling back to claude.ai")
+                    await self._page.goto(CLAUDE_WEB_URL, wait_until="domcontentloaded", timeout=30000)
+                    try:
+                        await self._page.wait_for_selector(INPUT_SELECTORS[0], timeout=8000)
+                    except Exception:
+                        await asyncio.sleep(1)
+                    log.info("Fallback: opened claude.ai")
 
             # Check if logged in
             logged_in = await self._is_logged_in()
