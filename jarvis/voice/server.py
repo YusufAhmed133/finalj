@@ -57,6 +57,28 @@ async def tts_endpoint(request: Request):
     return FileResponse(str(filename), media_type="audio/mpeg")
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Pre-generate ack audio on startup if missing."""
+    ack_dir = TTS_DIR / "ack"
+    ack_dir.mkdir(exist_ok=True)
+    acks = {
+        "ack1.mp3": "Yes sir.", "ack2.mp3": "Right away.",
+        "ack3.mp3": "On it.", "ack4.mp3": "One moment.",
+        "ack5.mp3": "Understood.",
+        "ack6.mp3": "Still working on that, one moment please.",
+    }
+    for fname, text in acks.items():
+        path = ack_dir / fname
+        if not path.exists():
+            try:
+                c = edge_tts.Communicate(text, voice=JARVIS_VOICE, rate="+5%", pitch="-2Hz")
+                await c.save(str(path))
+                log.info(f"Pre-cached {fname}")
+            except Exception:
+                pass
+
+
 @app.get("/api/ack")
 async def ack_endpoint():
     """Return a random pre-cached acknowledgment audio instantly."""
@@ -142,11 +164,13 @@ a{{color:#00d4ff;text-decoration:none}}
 
 @app.get("/admin/search", response_class=HTMLResponse)
 async def admin_search(q: str = ""):
+    from html import escape
     from jarvis.memory.spine import MemorySpine
     spine = _spine_ref or MemorySpine()
+    safe_q = escape(q)
     results = spine.search_text(q, limit=20) if q else []
-    rows = "".join(f'<tr><td>{r.get("tier","?")}</td><td>{(r.get("content") or "")[:200]}</td></tr>' for r in results)
-    return f"""<!DOCTYPE html><html><head><title>Search: {q}</title>
+    rows = "".join(f'<tr><td>{r.get("tier","?")}</td><td>{escape((r.get("content") or "")[:200])}</td></tr>' for r in results)
+    return f"""<!DOCTYPE html><html><head><title>Search: {safe_q}</title>
 <style>body{{background:#0a0e17;color:#e0e0e0;font-family:monospace;padding:20px}}
 h1{{color:#00d4ff}}table{{width:100%;border-collapse:collapse}}
 th,td{{text-align:left;padding:6px;border-bottom:1px solid #1a2030}}a{{color:#00d4ff}}</style></head><body>
@@ -165,6 +189,7 @@ ARC_REACTOR_HTML = r"""<!DOCTYPE html>
 <head>
 <title>J.A.R.V.I.S.</title>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body {

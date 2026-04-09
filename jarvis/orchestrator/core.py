@@ -43,8 +43,8 @@ class Orchestrator:
         self.spine = MemorySpine()
         self.graph = EntityGraph()
         self.intelligence = Intelligence()
-        self.briefing = BriefingGenerator(self.spine, self.intelligence, self.patterns)
         self.patterns = PatternLearner(self.spine)
+        self.briefing = BriefingGenerator(self.spine, self.intelligence, self.patterns)
 
         self.mode = Mode.ACTIVE
         self.running = False

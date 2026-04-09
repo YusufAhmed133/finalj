@@ -123,15 +123,33 @@ class TelegramBot:
         # Track context
         self._add_context("user", message)
 
+        # Show typing indicator while Claude thinks
+        async def _keep_typing():
+            try:
+                while True:
+                    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+                    await asyncio.sleep(4)
+            except asyncio.CancelledError:
+                pass
+
+        typing_task = asyncio.create_task(_keep_typing())
+
         # Route to orchestrator
-        response = await self._message_handler(
-            message=message,
-            source="telegram",
-            metadata={
-                "chat_id": update.effective_chat.id,
-                "message_id": update.message.message_id,
-            },
-        )
+        try:
+            response = await asyncio.wait_for(self._message_handler(
+                message=message,
+                source="telegram",
+                metadata={
+                    "chat_id": update.effective_chat.id,
+                    "message_id": update.message.message_id,
+                },
+            ), timeout=120)
+        except asyncio.TimeoutError:
+            response = "Took too long, sir. Try again?"
+        except Exception as e:
+            response = f"Error: {str(e)[:200]}"
+        finally:
+            typing_task.cancel()
 
         if response:
             self._add_context("JARVIS", response)
