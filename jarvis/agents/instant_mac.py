@@ -110,36 +110,51 @@ def _find_installed_app(name):
     return None
 
 
+def _verify_window(app_name, timeout=3):
+    """Verify an app window is visible. From ygwyg/system repo pattern."""
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        script = f'''
+        tell application "System Events"
+            if (name of processes) contains "{app_name}" then
+                return "running"
+            end if
+        end tell
+        return "not_found"
+        '''
+        out, ok = _run(["osascript", "-e", script], timeout=2)
+        if "running" in out:
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def _open_app(app_key):
-    """Open app and bring to foreground. Returns (message, success)."""
-    # Check known map first, then mdfind, then .title() fallback
+    """Open app, bring to foreground, verify it opened. Returns (message, success)."""
     app_name = APP_MAP.get(app_key)
     if not app_name:
         app_name = _find_installed_app(app_key)
     if not app_name:
         app_name = app_key.title()
 
-    # Use AppleScript to open AND activate (bring to front)
-    script = f'''
-    tell application "{app_name}"
-        activate
-    end tell
-    '''
-    out, ok = _run(["osascript", "-e", script])
+    log.info(f"Opening app: '{app_key}' → '{app_name}'")
 
-    if ok:
-        log.info(f"Opened and activated: {app_name}")
+    # Method 1: AppleScript activate (opens + foregrounds)
+    out, ok = _run(["osascript", "-e", f'tell application "{app_name}" to activate'])
+    if ok and _verify_window(app_name):
+        log.info(f"Opened and verified: {app_name}")
         return f"Done, sir. {app_name} is up.", True
 
-    # App not found by AppleScript — try `open -a` as fallback
+    # Method 2: open -a + activate
     out2, ok2 = _run(["open", "-a", app_name])
     if ok2:
-        # Also activate to bring to front
         _run(["osascript", "-e", f'tell application "{app_name}" to activate'])
-        log.info(f"Opened via open -a: {app_name}")
-        return f"Done, sir. {app_name} is up.", True
+        if _verify_window(app_name):
+            log.info(f"Opened via open -a: {app_name}")
+            return f"Done, sir. {app_name} is up.", True
 
-    # Try web fallback
+    # Method 3: Web fallback
     web = WEB_FALLBACK.get(app_key)
     if web:
         _run(["open", web])

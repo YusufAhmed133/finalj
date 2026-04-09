@@ -66,9 +66,12 @@ async def chat_endpoint(request: Request):
 
     # Fast path: instant Mac commands bypass LLM entirely (<100ms)
     from jarvis.agents.instant_mac import try_instant_command
+    log.info(f"Voice chat: '{text}'")
     instant = try_instant_command(text)
     if instant:
+        log.info(f"Instant command: {instant}")
         return JSONResponse({"response": instant, "instant": True})
+    log.info("Not instant, routing to Claude...")
 
     try:
         response = await _message_handler(message=text, source="voice", metadata={"is_voice": True})
