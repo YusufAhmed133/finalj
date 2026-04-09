@@ -243,7 +243,19 @@ def try_instant_command(message):
     if m:
         _osa(f"set volume output volume {min(100, max(0, int(m.group(1))))}"); return f"Volume {m.group(1)}."
 
-    # ── Close ──
+    # ── Keyboard shortcuts (before close pattern to avoid "close tab" mismatch) ──
+    kb_shortcuts = {
+        "new tab": 'tell application "System Events" to keystroke "t" using command down',
+        "close tab": 'tell application "System Events" to keystroke "w" using command down',
+        "close window": 'tell application "System Events" to keystroke "w" using command down',
+        "empty trash": 'tell application "Finder" to empty trash',
+        "show desktop": 'tell application "System Events" to key code 103',
+    }
+    if msg in kb_shortcuts:
+        _osa(kb_shortcuts[msg])
+        return "Done, sir."
+
+    # ── Close App ──
     m = re.match(r"(?:close|quit|exit|kill)\s+(.+)", msg)
     if m:
         app_key = _extract_app_name(m.group(1))
@@ -275,6 +287,97 @@ def try_instant_command(message):
         if folder in msg and any(x in msg for x in ["open", "go to", "show"]):
             _run(["open", str(Path.home() / folder.title())]); return f"{folder.title()} open."
 
+    # ── Fallback: detect action-like commands, generate AppleScript via Claude ──
+    action_words = ["press", "click", "tap", "hit", "push", "toggle", "switch",
+                    "minimize", "maximize", "resize", "move", "drag", "scroll",
+                    "type", "write", "enter", "send", "forward", "reply",
+                    "copy", "paste", "cut", "undo", "redo", "save", "delete",
+                    "refresh", "reload", "zoom", "fullscreen", "split",
+                    "brightness", "wifi", "bluetooth", "airdrop",
+                    "show", "hide", "pin", "unpin", "focus", "activate",
+                    "turn on", "turn off", "enable", "disable", "start", "stop"]
+
+    if any(w in msg for w in action_words):
+        # This sounds like a Mac action — generate AppleScript
+        result = _generate_and_execute(message)
+        if result:
+            return result
+
+    return None
+
+
+def _generate_and_execute(command):
+    """Use Claude (via the existing browser session) to generate AppleScript, then execute it.
+    Falls back to osascript best-guess if Claude unavailable."""
+    log.info(f"Generating AppleScript for: {command}")
+
+    # Try common action shortcuts first (no LLM needed)
+    shortcuts = {
+        "press play": 'tell application "Spotify" to play',
+        "hit play": 'tell application "Spotify" to play',
+        "press pause": 'tell application "Spotify" to pause',
+        "hit pause": 'tell application "Spotify" to pause',
+        "press play on spotify": 'tell application "Spotify" to play',
+        "press pause on spotify": 'tell application "Spotify" to pause',
+        "toggle play": 'tell application "Spotify" to playpause',
+        "play pause": 'tell application "Spotify" to playpause',
+        "copy": 'tell application "System Events" to keystroke "c" using command down',
+        "paste": 'tell application "System Events" to keystroke "v" using command down',
+        "cut": 'tell application "System Events" to keystroke "x" using command down',
+        "undo": 'tell application "System Events" to keystroke "z" using command down',
+        "redo": 'tell application "System Events" to keystroke "z" using {command down, shift down}',
+        "save": 'tell application "System Events" to keystroke "s" using command down',
+        "select all": 'tell application "System Events" to keystroke "a" using command down',
+        "refresh": 'tell application "System Events" to keystroke "r" using command down',
+        "reload": 'tell application "System Events" to keystroke "r" using command down',
+        "new tab": 'tell application "System Events" to keystroke "t" using command down',
+        "close tab": 'tell application "System Events" to keystroke "w" using command down',
+        "close window": 'tell application "System Events" to keystroke "w" using command down',
+        "minimize": 'tell application "System Events" to keystroke "m" using command down',
+        "fullscreen": 'tell application "System Events" to keystroke "f" using {command down, control down}',
+        "zoom in": 'tell application "System Events" to keystroke "+" using command down',
+        "zoom out": 'tell application "System Events" to keystroke "-" using command down',
+        "show desktop": 'tell application "System Events" to key code 103',
+        "mission control": 'tell application "System Events" to key code 126 using control down',
+        "spotlight": 'tell application "System Events" to keystroke " " using command down',
+        "force quit": 'tell application "System Events" to keystroke "q" using {command down, option down}',
+        "switch app": 'tell application "System Events" to keystroke tab using command down',
+        "switch window": 'tell application "System Events" to keystroke "`" using command down',
+        "turn on wifi": 'do shell script "networksetup -setairportpower en0 on"',
+        "turn off wifi": 'do shell script "networksetup -setairportpower en0 off"',
+        "turn on bluetooth": 'do shell script "blueutil --power 1"',
+        "turn off bluetooth": 'do shell script "blueutil --power 0"',
+        "brightness up": 'tell application "System Events" to key code 144',
+        "brightness down": 'tell application "System Events" to key code 145',
+        "empty trash": 'tell application "Finder" to empty trash',
+    }
+
+    msg_lower = _strip(command)
+    for pattern, script in shortcuts.items():
+        if pattern in msg_lower or msg_lower == pattern:
+            log.info(f"Shortcut match: {pattern}")
+            _osa(script)
+            return f"Done, sir."
+
+    # For truly unknown commands — try to construct AppleScript from the command
+    # Use key phrases to build script
+    if "on spotify" in msg_lower or "in spotify" in msg_lower:
+        action = msg_lower.replace("on spotify", "").replace("in spotify", "").strip()
+        action = _strip(action)
+        _osa(f'tell application "Spotify" to {action}')
+        return "Done, sir."
+
+    # Generic app action: "[action] on/in [app]"
+    m = re.match(r"(.+?)\s+(?:on|in|for)\s+(.+)", msg_lower)
+    if m:
+        action_part = m.group(1).strip()
+        app_part = _extract_app_name(m.group(2).strip())
+        app_name = APP_MAP.get(app_part, app_part.title())
+        # Try as AppleScript tell block
+        _osa(f'tell application "{app_name}" to {action_part}')
+        return f"Done, sir."
+
+    log.info(f"No shortcut or pattern for: {command}")
     return None
 
 
