@@ -63,6 +63,13 @@ async def chat_endpoint(request: Request):
     text = body.get("text", "").strip()
     if not text or not _message_handler:
         return JSONResponse({"response": "Not connected."})
+
+    # Fast path: instant Mac commands bypass LLM entirely (<100ms)
+    from jarvis.agents.instant_mac import try_instant_command
+    instant = try_instant_command(text)
+    if instant:
+        return JSONResponse({"response": instant, "instant": True})
+
     try:
         response = await _message_handler(message=text, source="voice", metadata={"is_voice": True})
         # Clean any thinking artifacts from response

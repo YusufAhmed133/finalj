@@ -23,6 +23,7 @@ from jarvis.brain.intelligence import Intelligence
 from jarvis.orchestrator.priority import score_priority, is_stop_command, is_cardiac_alert
 from jarvis.orchestrator.briefing import BriefingGenerator
 from jarvis.memory.patterns import PatternLearner
+from jarvis.agents.instant_mac import try_instant_command
 from jarvis.utils.logger import get_logger
 
 log = get_logger("orchestrator.core")
@@ -114,16 +115,22 @@ class Orchestrator:
         if message.startswith("/"):
             return await self._handle_command(message)
 
-        # Route to intelligence
-        memory_context = self._get_relevant_context(message)
+        # Step 1: Try instant Mac control (sub-second, no LLM)
+        instant = try_instant_command(message)
+        if instant:
+            self.spine.store(content=f"JARVIS: {instant}", type="interaction",
+                           source="jarvis", metadata={"in_reply_to": mem_id, "instant": True})
+            return instant
 
+        # Step 2: Route to Claude for everything else
+        memory_context = self._get_relevant_context(message)
         try:
             response = await self.intelligence.think(
                 message=message,
                 memory_context=memory_context,
             )
 
-            # Check if Claude returned a DO: command for Mac control
+            # Check if Claude returned DO: commands
             import subprocess
             clean_lines = []
             for line in response.split("\n"):
