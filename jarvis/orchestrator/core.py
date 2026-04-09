@@ -122,8 +122,11 @@ class Orchestrator:
                            source="jarvis", metadata={"in_reply_to": mem_id, "instant": True})
             return instant
 
-        # Step 2: Route to Claude for everything else
-        memory_context = self._get_relevant_context(message)
+        # Step 2: Route to intelligence for everything else
+        # Only search memory for substantive messages (not greetings/short)
+        memory_context = ""
+        if len(message.split()) > 3:
+            memory_context = self._get_relevant_context(message)
         try:
             response = await self.intelligence.think(
                 message=message,

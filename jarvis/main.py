@@ -50,13 +50,8 @@ class JARVIS:
         # 1. Initialize orchestrator (memory, intelligence, scheduler)
         await self.orchestrator.initialize()
 
-        # 2. Initialize computer use agent (uses browser brain, no API key needed)
-        computer_ok = await self.computer.initialize(brain=self.orchestrator.intelligence._browser)
-        if computer_ok:
-            self.orchestrator.computer = self.computer
-            log.info("Computer use agent ready (browser-powered)")
-        else:
-            log.warning("Computer use agent unavailable")
+        # 2. Computer use — handled by instant_mac + Gemini vision
+        log.info("Mac control: instant commands + Gemini vision")
 
         # 3. Initialize knowledge agent
         await self.knowledge.initialize()
