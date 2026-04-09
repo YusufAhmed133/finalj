@@ -107,7 +107,23 @@ class Orchestrator:
                            source="jarvis", metadata={"in_reply_to": mem_id, "action": True})
             return mac_result
 
-        # ── PATH 2: Questions → Claude ──
+        # ── PATH 2: Vision-powered Mac control (for anything mac_execute can't handle) ──
+        msg_lower = message.lower()
+        action_signals = ["open", "click", "go to", "play", "press", "close", "log in",
+                         "navigate", "download", "fill", "check my", "show me", "type",
+                         "switch", "search", "find", "launch", "start"]
+        is_action = any(msg_lower.startswith(s) for s in action_signals)
+        if is_action:
+            try:
+                from jarvis.agents.vision_control import vision_execute
+                result = await vision_execute(message)
+                self.spine.store(content=f"JARVIS: {result}", type="interaction",
+                               source="jarvis", metadata={"in_reply_to": mem_id, "vision": True})
+                return result
+            except Exception as e:
+                log.error(f"Vision control error: {e}")
+
+        # ── PATH 3: Questions → Claude ──
         memory_context = self._get_relevant_context(message) if len(message.split()) > 1 else ""
         try:
             response = await self.intelligence.think(message=message, memory_context=memory_context)
