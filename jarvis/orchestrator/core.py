@@ -114,42 +114,40 @@ class Orchestrator:
         if message.startswith("/"):
             return await self._handle_command(message)
 
-        # Check if this is a computer task
-        computer_keywords = ["open ", "launch ", "go to ", "navigate to ", "click ",
-                           "close ", "screenshot", "play ", "search for ", "type in ",
-                           "fill ", "send email", "check my calendar"]
-        is_computer_task = any(message.lower().startswith(kw) or message.lower().startswith("jarvis " + kw)
-                              for kw in computer_keywords)
-
-        if is_computer_task and hasattr(self, 'computer') and self.computer:
-            try:
-                # Route to computer agent
-                task_msg = message.lower().replace("jarvis ", "", 1).strip()
-                result = await self.computer.execute(task_msg)
-                self.spine.store(content=f"JARVIS (action): {result}", type="interaction",
-                               source="jarvis", metadata={"in_reply_to": mem_id})
-                return result
-            except Exception as e:
-                log.error(f"Computer use error: {e}")
-                return f"Tried to execute but hit an error: {str(e)[:200]}"
-
-        # Search memory for relevant context
+        # Route to intelligence
         memory_context = self._get_relevant_context(message)
 
-        # Route to intelligence — response comes back as plain text
         try:
             response = await self.intelligence.think(
                 message=message,
                 memory_context=memory_context,
             )
 
-            self.spine.store(content=f"JARVIS: {response}", type="interaction",
+            # Check if Claude returned a DO: command for Mac control
+            import subprocess
+            clean_lines = []
+            for line in response.split("\n"):
+                if line.strip().startswith("DO:"):
+                    cmd = line.strip()[3:].strip()
+                    log.info(f"Executing: {cmd}")
+                    try:
+                        if cmd.startswith("tell ") or cmd.startswith("do "):
+                            subprocess.run(["osascript", "-e", cmd], timeout=10, capture_output=True)
+                        else:
+                            subprocess.run(cmd, shell=True, timeout=10, capture_output=True)
+                    except Exception as e:
+                        log.error(f"Mac control error: {e}")
+                else:
+                    clean_lines.append(line)
+
+            reply = "\n".join(clean_lines).strip()
+            self.spine.store(content=f"JARVIS: {reply}", type="interaction",
                            source="jarvis", metadata={"in_reply_to": mem_id})
-            return response
+            return reply
 
         except Exception as e:
             log.error(f"Intelligence error: {e}")
-            return f"Sorry, hit an error: {str(e)[:200]}"
+            return f"Apologies sir, something went wrong: {str(e)[:150]}"
 
     async def _handle_stop(self) -> str:
         """Handle STOP/KILL command — halt everything immediately."""

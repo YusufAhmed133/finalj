@@ -44,7 +44,13 @@ INPUT_SELECTORS = [
 RESPONSE_JS = """() => {
     // Primary: .font-claude-response (stable class for Claude's responses)
     const msgs = document.querySelectorAll('.font-claude-response');
-    if (msgs.length > 0) return msgs[msgs.length - 1].innerText;
+    if (msgs.length > 0) {
+        let text = msgs[msgs.length - 1].innerText;
+        // Strip "Thinking about concerns" artifacts
+        text = text.replace(/Thinking about concerns with this request\s*/gi, '');
+        text = text.replace(/Thinking about[^.]*\.\s*/gi, '');
+        return text.trim();
+    }
     // Fallback: data-test-render-count conversation turns
     const turns = document.querySelectorAll('div[data-test-render-count]');
     if (turns.length > 0) return turns[turns.length - 1].innerText;
